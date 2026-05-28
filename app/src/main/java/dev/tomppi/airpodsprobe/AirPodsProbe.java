@@ -35,7 +35,7 @@ final class AirPodsProbe {
         this.log = log;
     }
 
-    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex, boolean doStability, boolean doHearingWriteVerify, boolean doHearingMethodExperiment) {
+    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex, boolean doStability, boolean doHearingWriteVerify, boolean doHearingMethodExperiment, boolean doHearingMapExperiment) {
         log.line("=== AirPods control probe started ===");
         log.line("Device: " + safeName(device) + " / " + device.getAddress());
         log.line("This app relies on the existing LibrePods Xposed module being active in com.android.bluetooth.");
@@ -76,6 +76,10 @@ final class AirPodsProbe {
 
         if (doHearingMethodExperiment) {
             testHearingAidWriteMethodExperiment(device);
+        }
+
+        if (doHearingMapExperiment) {
+            testHearingAidV13MapAndMonitor(device);
         }
 
         log.line("=== Probe finished ===");
@@ -262,6 +266,373 @@ final class AirPodsProbe {
             closeQuietly(aacpSocket);
             log.line("Hearing verifier sockets closed.");
         }
+    }
+
+
+    private void testHearingAidV13MapAndMonitor(BluetoothDevice device) {
+        log.line("--- v13 AACP hearing-capability + ATT map/notification monitor ---");
+        log.line("This test does not randomize payloads. It maps ATT handles around 0x002A/0x002B, enables CCCD modes on 0x002B, then watches AACP/ATT after a controlled 0x2A write.");
+        log.line("Goal: determine whether hearing-aid saving needs a nearby ATT handle, notification/indication, or an AACP commit/status message.");
+
+        ControlSession session = null;
+        byte[] baseline = null;
+        try {
+            session = openControlSession(device, "v13 baseline/map");
+            if (session.attSocket == null) {
+                log.line("v13 aborted: could not open ATT for baseline/map.");
+                return;
+            }
+
+            log.line("v13: draining AACP after init to catch capability/status messages.");
+            drainAacpResponsesVerbose(session.aacpSocket, 6, 650);
+
+            runAttDiscoveryAroundHearing(session.attSocket);
+            readNearbyAttHandles(session.attSocket, 0x0028, 0x002F);
+
+            baseline = attReadValue(session.attSocket, 0x002A, "v13 baseline HEARING_AID_CONFIG");
+            if (baseline == null || baseline.length < 12) {
+                log.line("v13 aborted: could not read baseline 0x002A or value too short.");
+                return;
+            }
+            log.line("v13 baseline 0x2A value: " + Hex.bytes(baseline, baseline.length));
+        } finally {
+            closeSession(session);
+        }
+
+        byte[] minimalMutation = baseline.clone();
+        minimalMutation[4] = (byte) (minimalMutation[4] == 0 ? 0x01 : 0x00);
+
+        int[] cccdModes = new int[] {0x0001, 0x0002, 0x0003};
+        String[] cccdLabels = new String[] {"notifications only 01 00", "indications only 02 00", "notifications+indications 03 00"};
+        for (int i = 0; i < cccdModes.length; i++) {
+            runV13CccdCommitProbe(device, cccdModes[i], cccdLabels[i], baseline, minimalMutation);
+        }
+
+        ControlSession finalSession = null;
+        try {
+            finalSession = openControlSession(device, "v13 final check");
+            if (finalSession.attSocket != null) {
+                byte[] finalValue = attReadValue(finalSession.attSocket, 0x002A, "v13 final HEARING_AID_CONFIG");
+                log.line("v13 final value equals baseline: " + Arrays.equals(baseline, finalValue));
+            }
+        } finally {
+            closeSession(finalSession);
+        }
+
+        log.line("v13 AACP/ATT map + monitor test complete.");
+    }
+
+    private void runV13CccdCommitProbe(BluetoothDevice device, int cccdMode, String modeLabel, byte[] baseline, byte[] mutated) {
+        String label = "v13 CCCD " + modeLabel;
+        log.line("--- " + label + " ---");
+        ControlSession session = null;
+        try {
+            session = openControlSession(device, label);
+            if (session.attSocket == null) {
+                log.line(label + ": skipped because ATT did not connect.");
+                return;
+            }
+
+            log.line(label + ": enabling 0x002B with mode " + String.format(Locale.US, "%02X %02X", cccdMode & 0xFF, (cccdMode >> 8) & 0xFF));
+            byte[] mode = new byte[] {(byte) (cccdMode & 0xFF), (byte) ((cccdMode >> 8) & 0xFF)};
+            byte[] cccdResponse = attWriteRequest(session.attSocket, 0x002B, mode, label + " write CCCD/control 0x002B");
+            log.line(label + ": 0x002B write response: " + (cccdResponse == null ? "null" : Hex.bytes(cccdResponse, cccdResponse.length)));
+
+            drainAttUnsolicited(session.attSocket, label + " after 0x002B enable", 4, 650);
+            drainAacpResponsesVerbose(session.aacpSocket, 4, 650);
+
+            byte[] before = attReadValue(session.attSocket, 0x002A, label + " before 0x2A write");
+            log.line(label + ": before-write equals baseline: " + Arrays.equals(baseline, before));
+
+            log.line(label + ": writing controlled 0x2A mutation: " + Hex.bytes(mutated, mutated.length));
+            byte[] wr = attWriteRequest(session.attSocket, 0x002A, mutated, label + " controlled 0x2A write");
+            log.line(label + ": 0x2A write response: " + (wr == null ? "null" : Hex.bytes(wr, wr.length)));
+
+            log.line(label + ": draining ATT unsolicited packets after 0x2A write.");
+            drainAttUnsolicited(session.attSocket, label + " after 0x2A write", 8, 700);
+            log.line(label + ": draining AACP packets after 0x2A write.");
+            drainAacpResponsesVerbose(session.aacpSocket, 8, 700);
+
+            int[] waits = new int[] {0, 250, 1000, 3000};
+            for (int wait : waits) {
+                if (wait > 0) sleep(wait);
+                byte[] rb = attReadValue(session.attSocket, 0x002A, label + " readback after " + wait + "ms");
+                if (rb == null) {
+                    log.line(label + ": readback failed after " + wait + "ms; stopping this mode.");
+                    break;
+                }
+                log.line(label + ": readback after " + wait + "ms equals mutated: " + Arrays.equals(mutated, rb) + ", equals baseline: " + Arrays.equals(baseline, rb));
+            }
+
+            log.line(label + ": attempting final baseline restore write, only in case mutation persisted.");
+            attWriteRequest(session.attSocket, 0x002A, baseline, label + " final restore 0x2A");
+            sleep(300);
+        } catch (Throwable t) {
+            log.line(label + ": failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
+        } finally {
+            closeSession(session);
+            sleep(1200);
+        }
+    }
+
+    private void runAttDiscoveryAroundHearing(BluetoothSocket socket) {
+        log.line("--- v13 ATT discovery around 0x0028–0x002F ---");
+        attFindInformation(socket, 0x0028, 0x002F);
+        attReadByTypeCharacteristicDeclarations(socket, 0x0020, 0x0035);
+        attFindInformation(socket, 0x0001, 0x0040);
+    }
+
+    private void readNearbyAttHandles(BluetoothSocket socket, int start, int end) {
+        log.line(String.format(Locale.US, "--- v13 individual safe reads 0x%04X–0x%04X ---", start, end));
+        for (int h = start; h <= end; h++) {
+            byte[] value = attReadValue(socket, h, String.format(Locale.US, "nearby handle 0x%04X", h));
+            if (value == null) {
+                log.line(String.format(Locale.US, "nearby handle 0x%04X: read failed/not readable", h));
+            }
+            sleep(120);
+        }
+    }
+
+    private void attFindInformation(BluetoothSocket socket, int start, int end) {
+        byte[] request = new byte[] {0x04, (byte)(start & 0xFF), (byte)((start >> 8) & 0xFF), (byte)(end & 0xFF), (byte)((end >> 8) & 0xFF)};
+        log.line(String.format(Locale.US, "ATT Find Information 0x%04X–0x%04X request: %s", start, end, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            byte[] response = readWithTimeout(socket, READ_TIMEOUT_MS);
+            if (response == null) {
+                log.line("ATT Find Information: no response.");
+                return;
+            }
+            log.line("ATT Find Information response: " + Hex.bytes(response, response.length));
+            parseAttFindInformation(response);
+        } catch (Exception e) {
+            log.line("ATT Find Information failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private void parseAttFindInformation(byte[] response) {
+        if (response.length == 0) return;
+        int opcode = response[0] & 0xFF;
+        if (opcode == 0x01) {
+            log.line("ATT Find Information error: " + parseAttError(response));
+            return;
+        }
+        if (opcode != 0x05 || response.length < 2) {
+            log.line("ATT Find Information: unexpected opcode 0x" + String.format(Locale.US, "%02X", opcode));
+            return;
+        }
+        int format = response[1] & 0xFF;
+        int offset = 2;
+        if (format == 0x01) {
+            while (offset + 3 < response.length) {
+                int handle = le16(response, offset);
+                int uuid = le16(response, offset + 2);
+                log.line(String.format(Locale.US, "  handle 0x%04X uuid 0x%04X%s", handle, uuid, describeAttUuid16(uuid)));
+                offset += 4;
+            }
+        } else if (format == 0x02) {
+            while (offset + 17 < response.length) {
+                int handle = le16(response, offset);
+                byte[] uuid = Arrays.copyOfRange(response, offset + 2, offset + 18);
+                log.line(String.format(Locale.US, "  handle 0x%04X uuid128-le %s", handle, Hex.bytes(uuid, uuid.length)));
+                offset += 18;
+            }
+        } else {
+            log.line("ATT Find Information: unknown format " + format);
+        }
+    }
+
+    private void attReadByTypeCharacteristicDeclarations(BluetoothSocket socket, int start, int end) {
+        byte[] request = new byte[] {0x08, (byte)(start & 0xFF), (byte)((start >> 8) & 0xFF), (byte)(end & 0xFF), (byte)((end >> 8) & 0xFF), 0x03, 0x28};
+        log.line(String.format(Locale.US, "ATT Read By Type characteristic declarations 0x%04X–0x%04X request: %s", start, end, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            byte[] response = readWithTimeout(socket, READ_TIMEOUT_MS);
+            if (response == null) {
+                log.line("ATT Read By Type: no response.");
+                return;
+            }
+            log.line("ATT Read By Type response: " + Hex.bytes(response, response.length));
+            parseAttReadByTypeCharacteristicDeclarations(response);
+        } catch (Exception e) {
+            log.line("ATT Read By Type failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private void parseAttReadByTypeCharacteristicDeclarations(byte[] response) {
+        if (response.length == 0) return;
+        int opcode = response[0] & 0xFF;
+        if (opcode == 0x01) {
+            log.line("ATT Read By Type error: " + parseAttError(response));
+            return;
+        }
+        if (opcode != 0x09 || response.length < 2) {
+            log.line("ATT Read By Type: unexpected opcode 0x" + String.format(Locale.US, "%02X", opcode));
+            return;
+        }
+        int len = response[1] & 0xFF;
+        int offset = 2;
+        while (len > 0 && offset + len <= response.length) {
+            int declHandle = le16(response, offset);
+            int props = response[offset + 2] & 0xFF;
+            int valueHandle = le16(response, offset + 3);
+            String uuidDesc;
+            if (len == 7) {
+                int uuid = le16(response, offset + 5);
+                uuidDesc = String.format(Locale.US, "0x%04X%s", uuid, describeAttUuid16(uuid));
+            } else {
+                byte[] uuid = Arrays.copyOfRange(response, offset + 5, offset + len);
+                uuidDesc = "128-le " + Hex.bytes(uuid, uuid.length);
+            }
+            log.line(String.format(Locale.US, "  char decl 0x%04X props 0x%02X valueHandle 0x%04X uuid %s%s", declHandle, props, valueHandle, uuidDesc, describeCharProperties(props)));
+            offset += len;
+        }
+    }
+
+    private void drainAttUnsolicited(BluetoothSocket socket, String label, int maxPackets, int timeoutMs) {
+        for (int i = 0; i < maxPackets; i++) {
+            byte[] p = readWithTimeout(socket, timeoutMs);
+            if (p == null) {
+                if (i == 0) log.line(label + ": no unsolicited ATT packets.");
+                return;
+            }
+            int opcode = p.length > 0 ? (p[0] & 0xFF) : -1;
+            log.line(label + ": unsolicited ATT packet " + (i + 1) + " opcode 0x" + String.format(Locale.US, "%02X", opcode) + ": " + Hex.bytes(p, p.length));
+            if (opcode == 0x1B && p.length >= 3) {
+                log.line(String.format(Locale.US, "  ATT notification on handle 0x%04X value %s", le16(p, 1), Hex.bytes(Arrays.copyOfRange(p, 3, p.length), Math.max(0, p.length - 3))));
+            } else if (opcode == 0x1D && p.length >= 3) {
+                log.line(String.format(Locale.US, "  ATT indication on handle 0x%04X value %s; sending Handle Value Confirmation 0x1E", le16(p, 1), Hex.bytes(Arrays.copyOfRange(p, 3, p.length), Math.max(0, p.length - 3))));
+                try { writeRaw(socket, new byte[] {0x1E}); } catch (IOException e) { log.line("  ATT indication confirmation failed: " + e.getMessage()); }
+            } else if (opcode == 0x01) {
+                log.line("  ATT error: " + parseAttError(p));
+            }
+        }
+    }
+
+    private void drainAacpResponsesVerbose(BluetoothSocket socket, int maxPackets, int timeoutMs) {
+        for (int i = 0; i < maxPackets; i++) {
+            byte[] response = readWithTimeout(socket, timeoutMs);
+            if (response == null) {
+                if (i == 0) log.line("AACP drain: no packets.");
+                return;
+            }
+            log.line("AACP drain packet " + (i + 1) + ": " + Hex.bytes(response, response.length));
+            logAacpPacketAnalysis("drain packet " + (i + 1), response);
+        }
+    }
+
+    private void logAacpPacketAnalysis(String label, byte[] packet) {
+        if (packet == null || packet.length == 0) return;
+        if (packet.length >= 4) {
+            int type = le16(packet, 0);
+            int service = le16(packet, 2);
+            log.line(String.format(Locale.US, "  AACP %s header: type/service? 0x%04X / 0x%04X", label, type, service));
+        }
+        if (packet.length >= 6) {
+            int msg = le16(packet, 4);
+            log.line(String.format(Locale.US, "  AACP %s message/command? 0x%04X%s", label, msg, describeAacpMessageOrCapability(msg)));
+            if (msg == 0x0002) {
+                parseAacpCapabilities(packet, 6, label + " capability-list");
+            }
+        }
+        scanAacpForKnownHearingCapabilities(packet, label);
+    }
+
+    private void parseAacpCapabilities(byte[] packet, int offset, String label) {
+        log.line("  AACP " + label + ": parsing capability bytes from offset " + offset + ".");
+        for (int i = offset; i < packet.length; i++) {
+            int cap = packet[i] & 0xFF;
+            String desc = describeAacpMessageOrCapability(cap);
+            if (!desc.isEmpty()) {
+                log.line(String.format(Locale.US, "    capability byte offset %d: 0x%02X%s", i, cap, desc));
+            }
+        }
+    }
+
+    private void scanAacpForKnownHearingCapabilities(byte[] packet, String label) {
+        int[] interesting = new int[] {0x31, 0xD0, 0xC0, 0x22, 0xD0, 0x28, 0x26};
+        boolean any = false;
+        for (int cap : interesting) {
+            for (int i = 0; i < packet.length; i++) {
+                if ((packet[i] & 0xFF) == cap) {
+                    if (!any) {
+                        log.line("  AACP " + label + " heuristic capability scan:");
+                        any = true;
+                    }
+                    log.line(String.format(Locale.US, "    found byte 0x%02X%s at offset %d", cap, describeAacpMessageOrCapability(cap), i));
+                }
+            }
+        }
+    }
+
+    private String describeAacpMessageOrCapability(int value) {
+        switch (value & 0xFFFF) {
+            case 0x0002: return " (Capabilities message?)";
+            case 0x0004: return " (AACP message/service 4?)";
+            case 0x0022: return " (hearingAidCapability?)";
+            case 0x0031: return " (hearingAidV2Capability?)";
+            case 0x00C0: return " (hearingAidCapability 0xC0?)";
+            case 0x00D0: return " (hearingTestCapability?)";
+            case 0x0028: return " (hearingProtectionPPECapability?)";
+            case 0x0026: return " (heartRateMonitorCapability?)";
+            default: return "";
+        }
+    }
+
+    private String describeAttUuid16(int uuid) {
+        switch (uuid & 0xFFFF) {
+            case 0x2800: return " (Primary Service)";
+            case 0x2801: return " (Secondary Service)";
+            case 0x2802: return " (Include)";
+            case 0x2803: return " (Characteristic Declaration)";
+            case 0x2901: return " (Characteristic User Description)";
+            case 0x2902: return " (Client Characteristic Configuration / CCCD)";
+            case 0x2903: return " (Server Characteristic Configuration)";
+            case 0x2A00: return " (Device Name)";
+            case 0x2A01: return " (Appearance)";
+            default: return "";
+        }
+    }
+
+    private String describeCharProperties(int props) {
+        List<String> names = new ArrayList<>();
+        if ((props & 0x02) != 0) names.add("read");
+        if ((props & 0x04) != 0) names.add("write-no-response");
+        if ((props & 0x08) != 0) names.add("write");
+        if ((props & 0x10) != 0) names.add("notify");
+        if ((props & 0x20) != 0) names.add("indicate");
+        if (names.isEmpty()) return "";
+        return " [" + String.join(",", names) + "]";
+    }
+
+    private String parseAttError(byte[] p) {
+        if (p == null || p.length < 5 || (p[0] & 0xFF) != 0x01) return "not an ATT error";
+        int reqOpcode = p[1] & 0xFF;
+        int handle = le16(p, 2);
+        int err = p[4] & 0xFF;
+        return String.format(Locale.US, "requestOpcode=0x%02X handle=0x%04X error=0x%02X%s", reqOpcode, handle, err, describeAttErrorCode(err));
+    }
+
+    private String describeAttErrorCode(int err) {
+        switch (err & 0xFF) {
+            case 0x01: return " (Invalid Handle)";
+            case 0x02: return " (Read Not Permitted)";
+            case 0x03: return " (Write Not Permitted)";
+            case 0x04: return " (Invalid PDU)";
+            case 0x05: return " (Insufficient Authentication)";
+            case 0x06: return " (Request Not Supported)";
+            case 0x07: return " (Invalid Offset)";
+            case 0x08: return " (Insufficient Authorization)";
+            case 0x0D: return " (Invalid Attribute Value Length)";
+            case 0x0E: return " (Unlikely Error)";
+            case 0x0F: return " (Insufficient Encryption)";
+            default: return "";
+        }
+    }
+
+    private int le16(byte[] b, int offset) {
+        if (b == null || offset + 1 >= b.length) return -1;
+        return (b[offset] & 0xFF) | ((b[offset + 1] & 0xFF) << 8);
     }
 
 
@@ -732,6 +1103,7 @@ final class AirPodsProbe {
                     log.line("AACP init " + label + ": no immediate response.");
                 } else {
                     log.line("AACP init " + label + " response: " + Hex.bytes(response, response.length));
+                    logAacpPacketAnalysis("init " + label, response);
                 }
             }
         } catch (IOException e) {
@@ -744,6 +1116,7 @@ final class AirPodsProbe {
             byte[] response = readWithTimeout(socket, 450);
             if (response == null) return;
             log.line("AACP extra response " + (i + 1) + ": " + Hex.bytes(response, response.length));
+            logAacpPacketAnalysis("extra response " + (i + 1), response);
         }
     }
 

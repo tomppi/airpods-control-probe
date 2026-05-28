@@ -41,6 +41,7 @@ public final class MainActivity extends Activity {
     private CheckBox stabilityTest;
     private CheckBox hearingWriteVerifier;
     private CheckBox hearingMethodExperiment;
+    private CheckBox hearingMapExperiment;
     private EditText rawHex;
     private ProbeLog log;
     private BroadcastReceiver bluetoothReceiver;
@@ -154,9 +155,14 @@ public final class MainActivity extends Activity {
         root.addView(hearingWriteVerifier, new LinearLayout.LayoutParams(-1, -2));
 
         hearingMethodExperiment = new CheckBox(this);
-        hearingMethodExperiment.setText("EXPERIMENTAL: test 0x2A write methods (temporary changed writes + restore)");
+        hearingMethodExperiment.setText("EXPERIMENTAL v12: isolated 0x2A raw mutation tests (temporary writes + restore)");
         hearingMethodExperiment.setChecked(false);
         root.addView(hearingMethodExperiment, new LinearLayout.LayoutParams(-1, -2));
+
+        hearingMapExperiment = new CheckBox(this);
+        hearingMapExperiment.setText("EXPERIMENTAL v13: map ATT 0x28–0x2F + monitor AACP/ATT after 0x2A write");
+        hearingMapExperiment.setChecked(false);
+        root.addView(hearingMapExperiment, new LinearLayout.LayoutParams(-1, -2));
 
         sendRaw = new CheckBox(this);
         sendRaw.setText("Advanced: send raw hex to PSM 31 once");
@@ -258,7 +264,8 @@ public final class MainActivity extends Activity {
                 rawHex.getText().toString(),
                 stabilityTest.isChecked(),
                 hearingWriteVerifier.isChecked(),
-                hearingMethodExperiment.isChecked()
+                hearingMethodExperiment.isChecked(),
+                hearingMapExperiment.isChecked()
         ), "airpods-probe-thread").start();
     }
 
