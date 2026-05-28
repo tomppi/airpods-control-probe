@@ -42,3 +42,8 @@ No local Gradle wrapper is required for GitHub Actions.
 Install the debug APK on the Android device where the LibrePods Xposed module is already active in `com.android.bluetooth`.
 
 The app itself does not install or replace the Xposed module. It only opens the same L2CAP/AACP/ATT paths used by the previous probe builds.
+
+
+## Fixed2 build note
+
+This package keeps the app source in `app/src/main/kotlin` and explicitly sets that as the only Java/Kotlin source root. This prevents the GitHub runner Kotlin compiler from seeing two `MainActivity` definitions if an older `src/main/java` copy remains in the repository.

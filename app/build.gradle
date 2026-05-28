@@ -15,6 +15,16 @@ android {
         versionName 'v15-github-runner'
     }
 
+
+
+    // Keep Kotlin sources in one explicit source root. This avoids duplicate MainActivity
+    // declarations on GitHub runners if an older src/main/java copy is still present.
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/kotlin']
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
