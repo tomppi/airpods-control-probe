@@ -1,64 +1,21 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
 }
 
 android {
-    namespace 'dev.tomppi.airpodsprobe'
+    namespace 'com.airpodsprobe.v19'
     compileSdk 35
 
     defaultConfig {
-        applicationId 'dev.tomppi.airpodsprobe'
-        minSdk 26
+        applicationId 'com.airpodsprobe.v19'
+        minSdk 29
         targetSdk 35
-        versionCode 17
-        versionName 'v18-github-runner'
-    }
-
-
-
-    // Keep Kotlin sources in one explicit source root. This avoids duplicate MainActivity
-    // declarations on GitHub runners if an older src/main/java copy is still present.
-    sourceSets {
-        main {
-            java.srcDirs = ['src/main/kotlin']
-        }
+        versionCode 19
+        versionName '19.0'
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-
-    signingConfigs {
-        ci {
-            def storeFilePath = project.findProperty('AIRPODS_PROBE_KEYSTORE') as String
-            def storePass = project.findProperty('AIRPODS_PROBE_KEYSTORE_PASSWORD') as String
-            def keyAliasValue = project.findProperty('AIRPODS_PROBE_KEY_ALIAS') as String
-            def keyPass = project.findProperty('AIRPODS_PROBE_KEY_PASSWORD') as String
-
-            if (storeFilePath != null && storePass != null && keyAliasValue != null && keyPass != null) {
-                storeFile file(storeFilePath)
-                storePassword storePass
-                keyAlias keyAliasValue
-                keyPassword keyPass
-            }
-        }
-    }
-
-    buildTypes {
-        debug {
-            signingConfig signingConfigs.debug
-        }
-        release {
-            minifyEnabled false
-            if (project.findProperty('AIRPODS_PROBE_KEYSTORE') != null) {
-                signingConfig signingConfigs.ci
-            }
-        }
-    }
-}
-
-kotlin {
-    jvmToolchain(17)
 }
