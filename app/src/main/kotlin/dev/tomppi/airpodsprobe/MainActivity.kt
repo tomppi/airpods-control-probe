@@ -57,16 +57,16 @@ class MainActivity : Activity() {
             setPadding(24, 24, 24, 24)
         }
         val title = TextView(this).apply {
-            text = "AirPods control probe v17\nAACP 0x53 / profile transaction probe"
+            text = "AirPods control probe v18\nAACP 0x53 init matrix + exact echo probe"
             textSize = 18f
         }
         val note = TextView(this).apply {
-            text = "v17 follows the v16 result: 0x52 was not the commit path. It pivots to the real new packets: AACP 0x0053 profile vectors, 0x0055 status, and the 0x0017 HID/service transaction after notify setup."
+            text = "v18 attributes AACP 0x0053/0x0055 to the init/post-init stream, sends only exact no-op 0x53/0x55 echoes, and retests ATT notify CCCDs only after AACP is fully idle."
             textSize = 13f
         }
         spinner = Spinner(this)
         refreshButton = Button(this).apply { text = "Refresh paired devices" }
-        runButton = Button(this).apply { text = "Run v17 probe"; isEnabled = false }
+        runButton = Button(this).apply { text = "Run v18 probe"; isEnabled = false }
         copyButton = Button(this).apply { text = "Copy log" }
         logView = TextView(this).apply {
             textSize = 12f
@@ -122,7 +122,7 @@ class MainActivity : Activity() {
         spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
         selectedDevice = devices.firstOrNull()
         runButton.isEnabled = selectedDevice != null
-        appendLog("Loaded ${devices.size} paired device(s). Pick AirPods Pro, then run v17.")
+        appendLog("Loaded ${devices.size} paired device(s). Pick AirPods Pro, then run v18.")
     }
 
     private fun startProbe() {
@@ -131,9 +131,9 @@ class MainActivity : Activity() {
         logBuffer.clear()
         logView.text = ""
         val sink: (String) -> Unit = { line -> appendLog(line) }
-        thread(name = "airpods-probe-v17") {
+        thread(name = "airpods-probe-v18") {
             try {
-                V17Probe(device, sink).run()
+                V18Probe(device, sink).run()
             } catch (t: Throwable) {
                 sink("FATAL: ${t.javaClass.simpleName}: ${t.message}")
             } finally {
@@ -151,7 +151,7 @@ class MainActivity : Activity() {
 
     private fun copyLog() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("AirPods probe v17 log", logBuffer.toString()))
+        clipboard.setPrimaryClip(ClipData.newPlainText("AirPods probe v18 log", logBuffer.toString()))
         appendLog("Log copied to clipboard.")
     }
 }
@@ -175,13 +175,18 @@ private data class AacpVariant(
     val packet: ByteArray,
 )
 
+private data class AacpInitVariant(
+    val name: String,
+    val steps: List<Pair<String, ByteArray>>,
+)
+
 private data class CaptureResult(
     val packets: List<ByteArray>,
     val first53: ByteArray?,
     val first55: ByteArray?,
 )
 
-private class V17Probe(
+private class V18Probe(
     private val device: BluetoothDevice,
     private val emit: (String) -> Unit,
 ) {
@@ -192,155 +197,355 @@ private class V17Probe(
         log("Device: ${safeName(device)} / ${device.address}")
         log("This app relies on the existing LibrePods Xposed module being active in com.android.bluetooth.")
         log("It does not install or replace the Xposed module.")
-        log("--- v17 AACP 0x53 profile/vector + 0x55 status probe ---")
-        log("v16 ruled out raw ATT writes and AACP 0x52-assisted commits.")
-        log("The important v16 clue was that enabling the notify path produced real AACP 0x0053 profile-vector packets, sometimes followed by 0x0055 status and large 0x0017 HID/service descriptors.")
-        log("v17 therefore does three things:")
-        log("  1) captures the full 0x0021/0x002A notify-triggered AACP transaction with a much deeper drain than v16.")
-        log("  2) decodes AACP 0x0053 as a candidate profile vector and AACP 0x0055 as status/ack material.")
-        log("  3) sends only no-op exact echoes of observed 0x0053/0x0055 packets, avoiding malformed 0x52 queries and avoiding new ATT value mutations.")
+        log("--- v18 AACP 0x53 init-matrix + exact echo probe ---")
+        log("v17 showed the key correction: 0x0053/0x0055 are real, but they mostly arrive during AACP init/post-init backlog, not as a durable ATT CCCD mutation path.")
+        log("v17 decoded 0x0053 as length=132, prefix=02 00 02 02, then 32 float32-le values of 0.5; 0x0055 appeared as 01 01 00 19.")
+        log("v18 therefore does three things:")
+        log("  1) runs an AACP init matrix to attribute which init/notification-request step creates 0x0053/0x0055/0x0017.")
+        log("  2) captures 0x0053/0x0055 from the init stream reliably, then sends only exact no-op echoes and reads 0x002A after each.")
+        log("  3) drains AACP fully before enabling ATT notify CCCDs, so stale post-init packets are not misattributed to 0x0022/0x002B.")
 
-        val baseline = session("v17 baseline/map") { aacp, att ->
-            drainAacp(aacp, "v17 baseline/map post-init", maxPackets = 64, timeoutMs = 2600)
+        val baseline = session("v18 baseline/map") { aacp, att ->
+            drainAacp(aacp, "v18 baseline/map post-init", maxPackets = 120, timeoutMs = 5200)
             discoverHearingHandles(att)
-            robustRead(att, 0x0021, "v17 baseline sibling 0x0021")
-            robustRead(att, 0x0024, "v17 baseline sibling 0x0024")
-            robustRead(att, 0x002A, "v17 baseline HEARING_AID_CONFIG")
+            robustRead(att, 0x0021, "v18 baseline sibling 0x0021")
+            robustRead(att, 0x0024, "v18 baseline sibling 0x0024")
+            robustRead(att, 0x002A, "v18 baseline HEARING_AID_CONFIG")
         }
 
         if (baseline == null) {
-            log("v17 aborted: could not read baseline handle 0x002A.")
+            log("v18 aborted: could not read baseline handle 0x002A.")
             log("=== Probe finished ===")
             return
         }
 
-        log("v17 baseline 0x2A value: ${hex(baseline)}")
-        log("v17 deliberately does not mutate byte[4] of 0x2A. v16 already proved raw 0x2A/0x21/0x26/0x28 writes do not persist.")
+        log("v18 baseline 0x2A value: ${hex(baseline)}")
+        describeHearingConfig("v18 baseline 0x002A", baseline)
+        log("v18 deliberately does not attempt any new ATT value mutation. Raw 0x2A/0x21/0x26/0x28 writes and 0x52-assisted commits were already ruled out by v15/v16.")
 
-        val capture = runV17ProfileTransactionCapture(baseline)
+        val capture = runV18InitMatrix(baseline)
         Thread.sleep(1200)
-        val echoChanged = runV17Aacp53EchoAndStatus(baseline, capture)
+        val echoChanged = runV18Captured53EchoAndStatus(baseline, capture)
         Thread.sleep(1200)
-        runV17SplitNotifyComparison(baseline)
+        runV18CccdAfterAacpIdle(baseline)
 
-        val finalValue = session("v17 final check") { _, att ->
-            robustRead(att, 0x002A, "v17 final HEARING_AID_CONFIG")
+        val finalValue = session("v18 final check") { _, att ->
+            robustRead(att, 0x002A, "v18 final HEARING_AID_CONFIG")
         }
         val finalEqualsBaseline = finalValue != null && finalValue.contentEquals(baseline)
-        log("v17 final value equals baseline: $finalEqualsBaseline")
+        log("v18 final value equals baseline: $finalEqualsBaseline")
         if (echoChanged) {
-            log("v17 result: an exact observed 0x53/0x55 echo changed 0x2A. Treat that echo section as the next implementation target, but manually verify the changed value.")
+            log("v18 result: an exact observed 0x53/0x55 echo changed 0x2A. Treat that echo section as the next implementation target, but manually verify the changed value.")
         } else {
-            log("v17 result: no exact 0x53/0x55 echo changed 0x2A. The useful output is the decoded profile/status transaction; next step is matching 0x53 fields to Apple hearing profile semantics, not raw ATT writes.")
+            log("v18 result: no exact 0x53/0x55 echo changed 0x2A. The useful result is the init-step attribution and the exact decoded 0x53 vector format.")
         }
-        log("v17 AACP 0x53 profile/vector + 0x55 status probe complete.")
+        log("v18 AACP 0x53 init-matrix + exact echo probe complete.")
         log("=== Probe finished ===")
     }
 
-    private fun runV17ProfileTransactionCapture(baseline: ByteArray): CaptureResult? {
-        log("--- v17 full notify-triggered AACP profile transaction capture ---")
-        return session("v17 full 0x53 capture") { aacp, att ->
+    private fun runV18InitMatrix(baseline: ByteArray): CaptureResult? {
+        log("--- v18 AACP init-step attribution matrix ---")
+        var best: CaptureResult? = null
+        for (variant in initVariants()) {
+            val result = sessionWithCustomInit("v18 init matrix ${variant.name}", variant.steps) { aacp, att, initPackets ->
+                val postPackets = drainAacp(aacp, "v18 init matrix ${variant.name} deep post-init", maxPackets = 220, timeoutMs = 7500)
+                val packets = initPackets + postPackets
+                summarizeAacpCapture("v18 init matrix ${variant.name}", packets)
+                val readback = robustRead(att, 0x002A, "v18 init matrix ${variant.name} 0x002A readback")
+                log("v18 init matrix ${variant.name}: 0x2A equals baseline: ${readback != null && readback.contentEquals(baseline)}")
+                CaptureResult(
+                    packets = packets,
+                    first53 = packets.firstOrNull { commandOf(it) == 0x0053 },
+                    first55 = packets.firstOrNull { commandOf(it) == 0x0055 },
+                )
+            }
+            if (best == null && result?.first53 != null) best = result
+            Thread.sleep(900)
+        }
+        if (best?.first53 == null) log("v18 init matrix: no 0x0053 packet captured in any variant.")
+        else log("v18 init matrix: selected first observed 0x0053/0x0055 capture for exact echo session.")
+        return best
+    }
+
+    private fun runV18Captured53EchoAndStatus(baseline: ByteArray, capture: CaptureResult?): Boolean {
+        log("--- v18 exact captured 0x53/0x55 echo session ---")
+        val observed53 = capture?.first53
+        if (observed53 == null) {
+            log("v18 echo skipped: no observed AACP 0x0053 packet was captured during the init matrix.")
+            return false
+        }
+        val observed55 = capture.first55
+        var changed = false
+        sessionWithCustomInit("v18 exact 0x53 echo", defaultInitSteps()) { aacp, att, initPackets ->
+            val postPackets = drainAacp(aacp, "v18 exact 0x53 echo post-init settle", maxPackets = 180, timeoutMs = 5200)
+            summarizeAacpCapture("v18 exact 0x53 echo local init stream", initPackets + postPackets)
+            val before = robustRead(att, 0x002A, "v18 exact 0x53 echo before")
+            log("v18 exact 0x53 echo: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+
+            sendAacp(aacp, "v18 exact captured 0x0053 echo", observed53)
+            drainAtt(att, "v18 after exact captured 0x0053 echo", maxPackets = 24, timeoutMs = 1200)
+            drainAacp(aacp, "v18 after exact captured 0x0053 echo", maxPackets = 64, timeoutMs = 2200)
+            val after53 = robustRead(att, 0x002A, "v18 readback after exact captured 0x0053 echo")
+            val after53Baseline = after53 != null && after53.contentEquals(baseline)
+            log("v18 exact captured 0x0053 echo: readback equals baseline: $after53Baseline")
+            if (after53 != null && !after53Baseline) {
+                log("v18 exact captured 0x0053 echo changed readback: ${hex(after53)}")
+                changed = true
+            }
+
+            if (observed55 != null) {
+                sendAacp(aacp, "v18 exact captured 0x0055 echo", observed55)
+                drainAtt(att, "v18 after exact captured 0x0055 echo", maxPackets = 24, timeoutMs = 1200)
+                drainAacp(aacp, "v18 after exact captured 0x0055 echo", maxPackets = 64, timeoutMs = 2200)
+                val after55 = robustRead(att, 0x002A, "v18 readback after exact captured 0x0055 echo")
+                val after55Baseline = after55 != null && after55.contentEquals(baseline)
+                log("v18 exact captured 0x0055 echo: readback equals baseline: $after55Baseline")
+                if (after55 != null && !after55Baseline) {
+                    log("v18 exact captured 0x0055 echo changed readback: ${hex(after55)}")
+                    changed = true
+                }
+
+                sendAacp(aacp, "v18 exact captured 0x0053+0x0055 sequence - 0x53", observed53)
+                sendAacp(aacp, "v18 exact captured 0x0053+0x0055 sequence - 0x55", observed55)
+                drainAtt(att, "v18 after exact captured 0x53+0x55 sequence", maxPackets = 24, timeoutMs = 1200)
+                drainAacp(aacp, "v18 after exact captured 0x53+0x55 sequence", maxPackets = 64, timeoutMs = 2200)
+                val afterBoth = robustRead(att, 0x002A, "v18 readback after exact captured 0x53+0x55 sequence")
+                val afterBothBaseline = afterBoth != null && afterBoth.contentEquals(baseline)
+                log("v18 exact captured 0x53+0x55 sequence: readback equals baseline: $afterBothBaseline")
+                if (afterBoth != null && !afterBothBaseline) {
+                    log("v18 exact captured 0x53+0x55 sequence changed readback: ${hex(afterBoth)}")
+                    changed = true
+                }
+            } else {
+                log("v18 exact 0x0055 echo skipped: the selected capture did not include 0x0055.")
+            }
+        }
+        log("v18 exact captured 0x53/0x55 echo changed 0x2A: $changed")
+        return changed
+    }
+
+    private fun runV18CccdAfterAacpIdle(baseline: ByteArray) {
+        log("--- v18 CCCD enable retest after full AACP idle ---")
+        sessionWithCustomInit("v18 CCCD after idle", defaultInitSteps()) { aacp, att, initPackets ->
+            val initTail = drainAacp(aacp, "v18 CCCD after idle full pre-CCCD drain", maxPackets = 240, timeoutMs = 8500)
+            val idleCheck = drainAacp(aacp, "v18 CCCD after idle idle-confirmation drain", maxPackets = 32, timeoutMs = 2500)
+            summarizeAacpCapture("v18 CCCD after idle pre-CCCD stream", initPackets + initTail + idleCheck)
+            val before = robustRead(att, 0x002A, "v18 CCCD after idle before")
+            log("v18 CCCD after idle: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+
+            for (step in listOf(
+                CccdStep("0x0021 notify CCCD 0x0022", 0x0022, byteArrayOf(0x01, 0x00)),
+                CccdStep("0x002A notify CCCD 0x002B", 0x002B, byteArrayOf(0x01, 0x00)),
+            )) {
+                log("v18 CCCD after idle: enabling ${step.name} at ${h(step.handle)} = ${hex(step.value)}")
+                robustWriteRequest(att, step.handle, step.value, "v18 CCCD after idle ${step.name}")
+                val attPackets = drainAtt(att, "v18 CCCD after idle after ${step.name}", maxPackets = 32, timeoutMs = 1500)
+                val aacpPackets = drainAacp(aacp, "v18 CCCD after idle after ${step.name}", maxPackets = 180, timeoutMs = 7200)
+                log("v18 CCCD after idle ${step.name}: ATT packets=${attPackets.size}, AACP packets=${aacpPackets.size}, saw0x53=${aacpPackets.any { commandOf(it) == 0x0053 }}, saw0x55=${aacpPackets.any { commandOf(it) == 0x0055 }}, saw0x17=${aacpPackets.any { commandOf(it) == 0x0017 }}")
+            }
+
+            val after = robustRead(att, 0x002A, "v18 CCCD after idle after")
+            log("v18 CCCD after idle: after equals baseline: ${after != null && after.contentEquals(baseline)}")
+        }
+    }
+
+    private fun initVariants(): List<AacpInitVariant> = listOf(
+        AacpInitVariant("default flags-D7 notify-FFFFFFFF", defaultInitSteps()),
+        AacpInitVariant("flags-D7 only no-0F-request", listOf(handshakeStep(), featureFlagsStep())),
+        AacpInitVariant("flags-D7 notify-00000000", listOf(handshakeStep(), featureFlagsStep(), notifyRequestStep("00 00 00 00"))),
+        AacpInitVariant("flags-D7 notify-01000000", listOf(handshakeStep(), featureFlagsStep(), notifyRequestStep("01 00 00 00"))),
+        AacpInitVariant("flags-D7 notify-02000000", listOf(handshakeStep(), featureFlagsStep(), notifyRequestStep("02 00 00 00"))),
+        AacpInitVariant("flags-D7 notify-FFFF0000", listOf(handshakeStep(), featureFlagsStep(), notifyRequestStep("FF FF 00 00"))),
+    )
+
+    private fun defaultInitSteps(): List<Pair<String, ByteArray>> = listOf(
+        handshakeStep(),
+        featureFlagsStep(),
+        notifyRequestStep("FF FF FF FF"),
+    )
+
+    private fun handshakeStep(): Pair<String, ByteArray> =
+        "handshake" to bytes("00 00 04 00 01 00 02 00 00 00 00 00 00 00 00 00")
+
+    private fun featureFlagsStep(): Pair<String, ByteArray> =
+        "set feature flags D7" to bytes("04 00 04 00 4D 00 D7 00 00 00 00 00 00 00")
+
+    private fun notifyRequestStep(maskHex: String): Pair<String, ByteArray> =
+        "request notifications mask $maskHex" to concat(bytes("04 00 04 00 0F 00"), bytes(maskHex))
+
+    private fun summarizeAacpCapture(label: String, packets: List<ByteArray>) {
+        val counts = packets.mapNotNull { commandOf(it) }.groupingBy { it }.eachCount()
+        val histogram = counts.entries.sortedBy { it.key }.joinToString { "0x${it.key.hex4()}=${it.value}" }
+        log("$label summary: packets=${packets.size}, commands=${histogram.ifBlank { "none" }}")
+        val first53 = packets.firstOrNull { commandOf(it) == 0x0053 }
+        val first55 = packets.firstOrNull { commandOf(it) == 0x0055 }
+        val first17 = packets.firstOrNull { commandOf(it) == 0x0017 }
+        log("$label summary flags: saw0x53=${first53 != null}, saw0x55=${first55 != null}, saw0x17=${first17 != null}")
+        if (first53 != null) describeAacp("$label first 0x0053", first53)
+        if (first55 != null) describeAacp("$label first 0x0055", first55)
+        if (first17 != null) describeAacp("$label first 0x0017", first17)
+    }
+
+    private fun describeHearingConfig(label: String, value: ByteArray) {
+        val nonZero = value.withIndex().filter { it.value.u() != 0 }.joinToString(limit = 18) { "[${it.index}]=0x${it.value.u().hex2()}" }
+        log("$label decode: len=${value.size}, nonZero=${nonZero.ifBlank { "none" }}")
+        if (value.size >= 4) {
+            log("$label decode: byte0=0x${value[0].u().hex2()}, byte1=0x${value[1].u().hex2()}, declared/body-ish word at [2..3]=${u16(value, 2)}")
+        }
+        if (value.isNotEmpty()) log("$label decode: last byte=0x${value.last().u().hex2()}")
+    }
+
+    private fun <T> sessionWithCustomInit(
+        label: String,
+        initSteps: List<Pair<String, ByteArray>>,
+        block: (BluetoothSocket, BluetoothSocket, List<ByteArray>) -> T?,
+    ): T? {
+        var aacp: BluetoothSocket? = null
+        var att: BluetoothSocket? = null
+        return try {
+            val aacpOpen = connectL2cap(PSM_AACP, label, preferAacp = true) ?: return null
+            aacp = aacpOpen.socket
+            log("$label: AACP PSM $PSM_AACP connected using ${aacpOpen.method}. Sending custom init sequence.")
+            val initPackets = sendAacpInitVariant(aacp, label, initSteps)
+            Thread.sleep(1000)
+            val attOpen = connectL2cap(PSM_ATT, label, preferAacp = false) ?: return null
+            att = attOpen.socket
+            log("$label: ATT PSM $PSM_ATT connected using ${attOpen.method}.")
+            block(aacp, att, initPackets)
+        } catch (t: Throwable) {
+            log("$label failed: ${t.javaClass.simpleName}: ${t.message}")
+            null
+        } finally {
+            closeQuietly(att)
+            closeQuietly(aacp)
+            log("$label sockets closed.")
+        }
+    }
+
+    private fun sendAacpInitVariant(socket: BluetoothSocket, label: String, steps: List<Pair<String, ByteArray>>): List<ByteArray> {
+        val packets = mutableListOf<ByteArray>()
+        for ((name, packet) in steps) {
+            log("$label AACP init send $name: ${hex(packet)}")
+            socket.outputStream.write(packet)
+            socket.outputStream.flush()
+            val response = readPacket(socket.inputStream, 900)
+            if (response != null) {
+                packets.add(response)
+                log("$label AACP init $name response: ${hex(response)}")
+                describeAacp("$label AACP init $name", response)
+            } else {
+                log("$label AACP init $name: no immediate response.")
+            }
+            packets.addAll(drainAacp(socket, "$label AACP init tail after $name", maxPackets = 24, timeoutMs = 900))
+            Thread.sleep(250)
+        }
+        return packets
+    }
+
+    private fun runV18ProfileTransactionCapture(baseline: ByteArray): CaptureResult? {
+        log("--- v18 full notify-triggered AACP profile transaction capture ---")
+        return session("v18 full 0x53 capture") { aacp, att ->
             val packets = mutableListOf<ByteArray>()
-            packets.addAll(drainAacp(aacp, "v17 full 0x53 capture post-init", maxPackets = 80, timeoutMs = 3000))
-            drainAtt(att, "v17 full 0x53 capture post-init", maxPackets = 16, timeoutMs = 1000)
-            val before = robustRead(att, 0x002A, "v17 full 0x53 capture baseline check")
-            log("v17 full 0x53 capture: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+            packets.addAll(drainAacp(aacp, "v18 full 0x53 capture post-init", maxPackets = 80, timeoutMs = 3000))
+            drainAtt(att, "v18 full 0x53 capture post-init", maxPackets = 16, timeoutMs = 1000)
+            val before = robustRead(att, 0x002A, "v18 full 0x53 capture baseline check")
+            log("v18 full 0x53 capture: before equals baseline: ${before != null && before.contentEquals(baseline)}")
 
             val steps = listOf(
                 CccdStep("0x0021 notify CCCD 0x0022", 0x0022, byteArrayOf(0x01, 0x00)),
                 CccdStep("0x002A notify CCCD 0x002B", 0x002B, byteArrayOf(0x01, 0x00)),
             )
             for (step in steps) {
-                log("v17 full 0x53 capture: enabling ${step.name} at ${h(step.handle)} = ${hex(step.value)}")
-                robustWriteRequest(att, step.handle, step.value, "v17 full 0x53 capture ${step.name}")
-                drainAtt(att, "v17 full 0x53 capture after ${step.name}", maxPackets = 32, timeoutMs = 1200)
-                packets.addAll(drainAacp(aacp, "v17 full 0x53 capture after ${step.name}", maxPackets = 96, timeoutMs = 5200))
+                log("v18 full 0x53 capture: enabling ${step.name} at ${h(step.handle)} = ${hex(step.value)}")
+                robustWriteRequest(att, step.handle, step.value, "v18 full 0x53 capture ${step.name}")
+                drainAtt(att, "v18 full 0x53 capture after ${step.name}", maxPackets = 32, timeoutMs = 1200)
+                packets.addAll(drainAacp(aacp, "v18 full 0x53 capture after ${step.name}", maxPackets = 96, timeoutMs = 5200))
                 Thread.sleep(500)
             }
 
-            robustRead(att, 0x0021, "v17 full 0x53 capture sibling 0x0021 after notify setup")
-            robustRead(att, 0x0024, "v17 full 0x53 capture sibling 0x0024 after notify setup")
-            val after = robustRead(att, 0x002A, "v17 full 0x53 capture final 0x2A")
-            log("v17 full 0x53 capture: final 0x2A equals baseline: ${after != null && after.contentEquals(baseline)}")
+            robustRead(att, 0x0021, "v18 full 0x53 capture sibling 0x0021 after notify setup")
+            robustRead(att, 0x0024, "v18 full 0x53 capture sibling 0x0024 after notify setup")
+            val after = robustRead(att, 0x002A, "v18 full 0x53 capture final 0x2A")
+            log("v18 full 0x53 capture: final 0x2A equals baseline: ${after != null && after.contentEquals(baseline)}")
 
             val first53 = packets.firstOrNull { commandOf(it) == 0x0053 }
             val first55 = packets.firstOrNull { commandOf(it) == 0x0055 }
-            log("v17 full 0x53 capture summary: packets=${packets.size}, saw0x53=${first53 != null}, saw0x55=${first55 != null}, saw0x17=${packets.any { commandOf(it) == 0x0017 }}")
+            log("v18 full 0x53 capture summary: packets=${packets.size}, saw0x53=${first53 != null}, saw0x55=${first55 != null}, saw0x17=${packets.any { commandOf(it) == 0x0017 }}")
             CaptureResult(packets.toList(), first53, first55)
         }
     }
 
-    private fun runV17Aacp53EchoAndStatus(baseline: ByteArray, capture: CaptureResult?): Boolean {
-        log("--- v17 exact observed 0x53/0x55 echo no-op session ---")
+    private fun runV18Aacp53EchoAndStatus(baseline: ByteArray, capture: CaptureResult?): Boolean {
+        log("--- v18 exact observed 0x53/0x55 echo no-op session ---")
         if (capture?.first53 == null) {
-            log("v17 echo skipped: no observed AACP 0x0053 packet was captured.")
+            log("v18 echo skipped: no observed AACP 0x0053 packet was captured.")
             return false
         }
         var changed = false
-        session("v17 0x53 echo") { aacp, att ->
-            drainAacp(aacp, "v17 0x53 echo post-init", maxPackets = 64, timeoutMs = 2600)
-            enableNotifyPairOnly(att, aacp, "v17 0x53 echo")
-            val before = robustRead(att, 0x002A, "v17 0x53 echo before")
-            log("v17 0x53 echo: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+        session("v18 0x53 echo") { aacp, att ->
+            drainAacp(aacp, "v18 0x53 echo post-init", maxPackets = 64, timeoutMs = 2600)
+            enableNotifyPairOnly(att, aacp, "v18 0x53 echo")
+            val before = robustRead(att, 0x002A, "v18 0x53 echo before")
+            log("v18 0x53 echo: before equals baseline: ${before != null && before.contentEquals(baseline)}")
 
-            sendAacp(aacp, "v17 exact observed 0x0053 echo", capture.first53)
-            drainAtt(att, "v17 after exact 0x0053 echo", maxPackets = 24, timeoutMs = 1200)
-            val after53 = robustRead(att, 0x002A, "v17 readback after exact 0x0053 echo")
+            sendAacp(aacp, "v18 exact observed 0x0053 echo", capture.first53)
+            drainAtt(att, "v18 after exact 0x0053 echo", maxPackets = 24, timeoutMs = 1200)
+            val after53 = robustRead(att, 0x002A, "v18 readback after exact 0x0053 echo")
             val after53Baseline = after53 != null && after53.contentEquals(baseline)
-            log("v17 exact 0x0053 echo: readback equals baseline: $after53Baseline")
+            log("v18 exact 0x0053 echo: readback equals baseline: $after53Baseline")
             if (after53 != null && !after53Baseline) {
-                log("v17 exact 0x0053 echo changed readback: ${hex(after53)}")
+                log("v18 exact 0x0053 echo changed readback: ${hex(after53)}")
                 changed = true
             }
 
             val status = capture.first55
             if (status != null) {
-                sendAacp(aacp, "v17 exact observed 0x0055 echo", status)
-                drainAtt(att, "v17 after exact 0x0055 echo", maxPackets = 24, timeoutMs = 1200)
-                val after55 = robustRead(att, 0x002A, "v17 readback after exact 0x0055 echo")
+                sendAacp(aacp, "v18 exact observed 0x0055 echo", status)
+                drainAtt(att, "v18 after exact 0x0055 echo", maxPackets = 24, timeoutMs = 1200)
+                val after55 = robustRead(att, 0x002A, "v18 readback after exact 0x0055 echo")
                 val after55Baseline = after55 != null && after55.contentEquals(baseline)
-                log("v17 exact 0x0055 echo: readback equals baseline: $after55Baseline")
+                log("v18 exact 0x0055 echo: readback equals baseline: $after55Baseline")
                 if (after55 != null && !after55Baseline) {
-                    log("v17 exact 0x0055 echo changed readback: ${hex(after55)}")
+                    log("v18 exact 0x0055 echo changed readback: ${hex(after55)}")
                     changed = true
                 }
 
-                sendAacp(aacp, "v17 exact observed 0x0053 then 0x0055 sequence - 0x53", capture.first53)
-                sendAacp(aacp, "v17 exact observed 0x0053 then 0x0055 sequence - 0x55", status)
-                drainAtt(att, "v17 after exact 0x53+0x55 sequence", maxPackets = 24, timeoutMs = 1200)
-                val afterBoth = robustRead(att, 0x002A, "v17 readback after exact 0x53+0x55 sequence")
+                sendAacp(aacp, "v18 exact observed 0x0053 then 0x0055 sequence - 0x53", capture.first53)
+                sendAacp(aacp, "v18 exact observed 0x0053 then 0x0055 sequence - 0x55", status)
+                drainAtt(att, "v18 after exact 0x53+0x55 sequence", maxPackets = 24, timeoutMs = 1200)
+                val afterBoth = robustRead(att, 0x002A, "v18 readback after exact 0x53+0x55 sequence")
                 val afterBothBaseline = afterBoth != null && afterBoth.contentEquals(baseline)
-                log("v17 exact 0x53+0x55 sequence: readback equals baseline: $afterBothBaseline")
+                log("v18 exact 0x53+0x55 sequence: readback equals baseline: $afterBothBaseline")
                 if (afterBoth != null && !afterBothBaseline) {
-                    log("v17 exact 0x53+0x55 sequence changed readback: ${hex(afterBoth)}")
+                    log("v18 exact 0x53+0x55 sequence changed readback: ${hex(afterBoth)}")
                     changed = true
                 }
             } else {
-                log("v17 0x55 echo skipped: no observed AACP 0x0055 packet was captured.")
+                log("v18 0x55 echo skipped: no observed AACP 0x0055 packet was captured.")
             }
         }
-        log("v17 exact 0x53/0x55 echo no-op changed 0x2A: $changed")
+        log("v18 exact 0x53/0x55 echo no-op changed 0x2A: $changed")
         return changed
     }
 
-    private fun runV17SplitNotifyComparison(baseline: ByteArray) {
-        log("--- v17 isolated 0x0022-vs-0x002B notify comparison ---")
+    private fun runV18SplitNotifyComparison(baseline: ByteArray) {
+        log("--- v18 isolated 0x0022-vs-0x002B notify comparison ---")
         val isolated = listOf(
             CccdStep("only 0x0021 notify CCCD 0x0022", 0x0022, byteArrayOf(0x01, 0x00)),
             CccdStep("only 0x002A notify CCCD 0x002B", 0x002B, byteArrayOf(0x01, 0x00)),
         )
         for (step in isolated) {
-            session("v17 ${step.name}") { aacp, att ->
-                drainAacp(aacp, "v17 ${step.name} post-init", maxPackets = 80, timeoutMs = 3000)
-                drainAtt(att, "v17 ${step.name} post-init", maxPackets = 16, timeoutMs = 1000)
-                val before = robustRead(att, 0x002A, "v17 ${step.name} before")
-                log("v17 ${step.name}: before equals baseline: ${before != null && before.contentEquals(baseline)}")
-                robustWriteRequest(att, step.handle, step.value, "v17 ${step.name}")
-                val attPackets = drainAtt(att, "v17 ${step.name} after enable", maxPackets = 32, timeoutMs = 1500)
-                val aacpPackets = drainAacp(aacp, "v17 ${step.name} after enable", maxPackets = 120, timeoutMs = 6500)
-                val after = robustRead(att, 0x002A, "v17 ${step.name} after")
-                log("v17 ${step.name}: after equals baseline: ${after != null && after.contentEquals(baseline)}")
-                log("v17 ${step.name} summary: ATT packets=${attPackets.size}, AACP packets=${aacpPackets.size}, saw0x53=${aacpPackets.any { commandOf(it) == 0x0053 }}, saw0x55=${aacpPackets.any { commandOf(it) == 0x0055 }}, saw0x17=${aacpPackets.any { commandOf(it) == 0x0017 }}")
+            session("v18 ${step.name}") { aacp, att ->
+                drainAacp(aacp, "v18 ${step.name} post-init", maxPackets = 80, timeoutMs = 3000)
+                drainAtt(att, "v18 ${step.name} post-init", maxPackets = 16, timeoutMs = 1000)
+                val before = robustRead(att, 0x002A, "v18 ${step.name} before")
+                log("v18 ${step.name}: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+                robustWriteRequest(att, step.handle, step.value, "v18 ${step.name}")
+                val attPackets = drainAtt(att, "v18 ${step.name} after enable", maxPackets = 32, timeoutMs = 1500)
+                val aacpPackets = drainAacp(aacp, "v18 ${step.name} after enable", maxPackets = 120, timeoutMs = 6500)
+                val after = robustRead(att, 0x002A, "v18 ${step.name} after")
+                log("v18 ${step.name}: after equals baseline: ${after != null && after.contentEquals(baseline)}")
+                log("v18 ${step.name} summary: ATT packets=${attPackets.size}, AACP packets=${aacpPackets.size}, saw0x53=${aacpPackets.any { commandOf(it) == 0x0053 }}, saw0x55=${aacpPackets.any { commandOf(it) == 0x0055 }}, saw0x17=${aacpPackets.any { commandOf(it) == 0x0017 }}")
             }
             Thread.sleep(1000)
         }
@@ -360,94 +565,94 @@ private class V17Probe(
     }
 
     private fun runCccdAttribution(baseline: ByteArray) {
-        log("--- v17 CCCD attribution session: find what triggers AACP 0x0052 ---")
-        session("v17 CCCD attribution") { aacp, att ->
-            drainAacp(aacp, "v17 CCCD attribution post-init", timeoutMs = 1500)
-            drainAtt(att, "v17 CCCD attribution post-init")
-            val before = robustRead(att, 0x002A, "v17 CCCD attribution baseline check")
-            log("v17 CCCD attribution: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+        log("--- v18 CCCD attribution session: find what triggers AACP 0x0052 ---")
+        session("v18 CCCD attribution") { aacp, att ->
+            drainAacp(aacp, "v18 CCCD attribution post-init", timeoutMs = 1500)
+            drainAtt(att, "v18 CCCD attribution post-init")
+            val before = robustRead(att, 0x002A, "v18 CCCD attribution baseline check")
+            log("v18 CCCD attribution: before equals baseline: ${before != null && before.contentEquals(baseline)}")
 
             for (step in cccdSteps()) {
-                log("v17 CCCD attribution: enabling ${step.name} at ${h(step.handle)} = ${hex(step.value)}")
-                robustWriteRequest(att, step.handle, step.value, "v17 CCCD attribution ${step.name}")
-                drainAtt(att, "v17 CCCD attribution after ${step.name}", timeoutMs = 600)
-                val aacpPackets = drainAacp(aacp, "v17 CCCD attribution after ${step.name}", timeoutMs = 2200)
+                log("v18 CCCD attribution: enabling ${step.name} at ${h(step.handle)} = ${hex(step.value)}")
+                robustWriteRequest(att, step.handle, step.value, "v18 CCCD attribution ${step.name}")
+                drainAtt(att, "v18 CCCD attribution after ${step.name}", timeoutMs = 600)
+                val aacpPackets = drainAacp(aacp, "v18 CCCD attribution after ${step.name}", timeoutMs = 2200)
                 val saw52 = aacpPackets.any { it.size >= 6 && u16(it, 4) == 0x0052 }
-                log("v17 CCCD attribution: ${step.name} produced AACP 0x0052: $saw52")
+                log("v18 CCCD attribution: ${step.name} produced AACP 0x0052: $saw52")
                 Thread.sleep(350)
             }
 
-            val after = robustRead(att, 0x002A, "v17 CCCD attribution final 0x2A")
-            log("v17 CCCD attribution: final 0x2A equals baseline: ${after != null && after.contentEquals(baseline)}")
+            val after = robustRead(att, 0x002A, "v18 CCCD attribution final 0x2A")
+            log("v18 CCCD attribution: final 0x2A equals baseline: ${after != null && after.contentEquals(baseline)}")
         }
     }
 
     private fun runAacp52Variants(baseline: ByteArray, target: ByteArray) {
-        log("--- v17 AACP 0x0052 direct status/query variants ---")
-        session("v17 AACP 0x52 variants") { aacp, att ->
-            drainAacp(aacp, "v17 AACP 0x52 variants post-init", timeoutMs = 1500)
-            enableAllNotifyIndicate(att, aacp, "v17 AACP 0x52 variants")
-            val before = robustRead(att, 0x002A, "v17 AACP 0x52 variants before")
-            log("v17 AACP 0x52 variants: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+        log("--- v18 AACP 0x0052 direct status/query variants ---")
+        session("v18 AACP 0x52 variants") { aacp, att ->
+            drainAacp(aacp, "v18 AACP 0x52 variants post-init", timeoutMs = 1500)
+            enableAllNotifyIndicate(att, aacp, "v18 AACP 0x52 variants")
+            val before = robustRead(att, 0x002A, "v18 AACP 0x52 variants before")
+            log("v18 AACP 0x52 variants: before equals baseline: ${before != null && before.contentEquals(baseline)}")
 
             for (variant in aacpVariants()) {
                 sendAacp(aacp, variant.name, variant.packet)
-                drainAtt(att, "v17 AACP 0x52 variants after ${variant.name}", timeoutMs = 700)
-                val after = robustRead(att, 0x002A, "v17 AACP 0x52 variants readback after ${variant.name}")
+                drainAtt(att, "v18 AACP 0x52 variants after ${variant.name}", timeoutMs = 700)
+                val after = robustRead(att, 0x002A, "v18 AACP 0x52 variants readback after ${variant.name}")
                 val equalsTarget = after != null && after.contentEquals(target)
                 val equalsBaseline = after != null && after.contentEquals(baseline)
-                log("v17 AACP 0x52 variants: ${variant.name} readback equals mutated: $equalsTarget, equals baseline: $equalsBaseline")
-                if (after != null && !equalsBaseline) log("v17 AACP 0x52 variants: ${variant.name} readback value: ${hex(after)}")
+                log("v18 AACP 0x52 variants: ${variant.name} readback equals mutated: $equalsTarget, equals baseline: $equalsBaseline")
+                if (after != null && !equalsBaseline) log("v18 AACP 0x52 variants: ${variant.name} readback value: ${hex(after)}")
                 Thread.sleep(600)
             }
 
             // Try to leave any 0x52 status bit in the lower/false-looking state observed by the variant set.
-            sendAacp(aacp, "v17 AACP 0x52 variants final observed-status-00 restore", bytes("04 00 04 00 52 00 03 00 02 01 00"))
-            robustWriteCommand(att, 0x002A, baseline, "v17 AACP 0x52 variants direct 0x2A baseline fallback")
+            sendAacp(aacp, "v18 AACP 0x52 variants final observed-status-00 restore", bytes("04 00 04 00 52 00 03 00 02 01 00"))
+            robustWriteCommand(att, 0x002A, baseline, "v18 AACP 0x52 variants direct 0x2A baseline fallback")
         }
     }
 
     private fun runAacpCommitAfterAttWrites(baseline: ByteArray, target: ByteArray): Boolean {
-        log("--- v17 AACP 0x0052 commit-after-ATT-staged-write session ---")
+        log("--- v18 AACP 0x0052 commit-after-ATT-staged-write session ---")
         var anyHit = false
-        session("v17 AACP commit after ATT") { aacp, att ->
-            drainAacp(aacp, "v17 AACP commit after ATT post-init", timeoutMs = 1500)
-            enableAllNotifyIndicate(att, aacp, "v17 AACP commit after ATT")
-            val before = robustRead(att, 0x002A, "v17 AACP commit before routes")
-            log("v17 AACP commit after ATT: before equals baseline: ${before != null && before.contentEquals(baseline)}")
+        session("v18 AACP commit after ATT") { aacp, att ->
+            drainAacp(aacp, "v18 AACP commit after ATT post-init", timeoutMs = 1500)
+            enableAllNotifyIndicate(att, aacp, "v18 AACP commit after ATT")
+            val before = robustRead(att, 0x002A, "v18 AACP commit before routes")
+            log("v18 AACP commit after ATT: before equals baseline: ${before != null && before.contentEquals(baseline)}")
 
             for (route in commitRoutes()) {
-                log("v17 AACP commit route: ${route.name} staging target on ${h(route.handle)} using ${route.writeKind}")
+                log("v18 AACP commit route: ${route.name} staging target on ${h(route.handle)} using ${route.writeKind}")
                 when (route.writeKind) {
-                    WriteKind.REQUEST -> robustWriteRequest(att, route.handle, target, "v17 AACP commit stage ${route.name}")
-                    WriteKind.COMMAND -> robustWriteCommand(att, route.handle, target, "v17 AACP commit stage ${route.name}")
+                    WriteKind.REQUEST -> robustWriteRequest(att, route.handle, target, "v18 AACP commit stage ${route.name}")
+                    WriteKind.COMMAND -> robustWriteCommand(att, route.handle, target, "v18 AACP commit stage ${route.name}")
                 }
-                drainAtt(att, "v17 AACP commit ${route.name} after staging", timeoutMs = 700)
-                drainAacp(aacp, "v17 AACP commit ${route.name} after staging", timeoutMs = 900)
+                drainAtt(att, "v18 AACP commit ${route.name} after staging", timeoutMs = 700)
+                drainAacp(aacp, "v18 AACP commit ${route.name} after staging", timeoutMs = 900)
 
                 for (commit in commitVariants()) {
-                    sendAacp(aacp, "v17 AACP commit ${route.name} ${commit.name}", commit.packet)
-                    drainAtt(att, "v17 AACP commit ${route.name} after ${commit.name}", timeoutMs = 800)
-                    val readback = robustRead(att, 0x002A, "v17 AACP commit ${route.name} readback after ${commit.name}")
+                    sendAacp(aacp, "v18 AACP commit ${route.name} ${commit.name}", commit.packet)
+                    drainAtt(att, "v18 AACP commit ${route.name} after ${commit.name}", timeoutMs = 800)
+                    val readback = robustRead(att, 0x002A, "v18 AACP commit ${route.name} readback after ${commit.name}")
                     val equalsTarget = readback != null && readback.contentEquals(target)
                     val equalsBaseline = readback != null && readback.contentEquals(baseline)
-                    log("v17 AACP commit ${route.name} ${commit.name}: readback equals mutated: $equalsTarget, equals baseline: $equalsBaseline")
-                    if (readback != null && !equalsBaseline) log("v17 AACP commit ${route.name} ${commit.name}: readback value: ${hex(readback)}")
+                    log("v18 AACP commit ${route.name} ${commit.name}: readback equals mutated: $equalsTarget, equals baseline: $equalsBaseline")
+                    if (readback != null && !equalsBaseline) log("v18 AACP commit ${route.name} ${commit.name}: readback value: ${hex(readback)}")
                     if (equalsTarget) anyHit = true
                     Thread.sleep(500)
                 }
 
-                log("v17 AACP commit route: ${route.name} restore attempt.")
+                log("v18 AACP commit route: ${route.name} restore attempt.")
                 when (route.writeKind) {
-                    WriteKind.REQUEST -> robustWriteRequest(att, route.handle, baseline, "v17 AACP commit restore ${route.name}")
-                    WriteKind.COMMAND -> robustWriteCommand(att, route.handle, baseline, "v17 AACP commit restore ${route.name}")
+                    WriteKind.REQUEST -> robustWriteRequest(att, route.handle, baseline, "v18 AACP commit restore ${route.name}")
+                    WriteKind.COMMAND -> robustWriteCommand(att, route.handle, baseline, "v18 AACP commit restore ${route.name}")
                 }
-                sendAacp(aacp, "v17 AACP commit ${route.name} restore observed-status-00", bytes("04 00 04 00 52 00 03 00 02 01 00"))
-                robustWriteCommand(att, 0x002A, baseline, "v17 AACP commit ${route.name} direct 0x2A baseline fallback")
+                sendAacp(aacp, "v18 AACP commit ${route.name} restore observed-status-00", bytes("04 00 04 00 52 00 03 00 02 01 00"))
+                robustWriteCommand(att, 0x002A, baseline, "v18 AACP commit ${route.name} direct 0x2A baseline fallback")
                 Thread.sleep(900)
             }
         }
-        log("v17 AACP commit-after-ATT overall HIT: $anyHit")
+        log("v18 AACP commit-after-ATT overall HIT: $anyHit")
         return anyHit
     }
 
@@ -573,10 +778,10 @@ private class V17Probe(
     }
 
     private fun discoverHearingHandles(att: BluetoothSocket) {
-        log("--- v17 ATT discovery around hearing handles 0x0020–0x0038 ---")
+        log("--- v18 ATT discovery around hearing handles 0x0020–0x0038 ---")
         findInfoPaged(att, 0x0020, 0x0038)
         readByTypeCharacteristicDeclarations(att, 0x0020, 0x0038)
-        log("v17 expected map from v14/v15:")
+        log("v18 expected map from v14/v15:")
         log("  0x0021 read/write-no-response/notify, CCCD 0x0022")
         log("  0x0026 write-no-response")
         log("  0x0028 write-request")

@@ -1,27 +1,28 @@
-# AirPods Control Probe v17
+# AirPods Control Probe v18
 
 Android probe app for GitHub-hosted runners.
 
 This repo is set up to build on GitHub Actions using Ubuntu, JDK 17, Gradle 8.10.2, Android SDK 35, and a CI-generated release keystore.
 
-## What v17 tests
+## What v18 tests
 
-v15 showed that raw ATT writes to the hearing-aid region did not persist:
+v17 corrected the main attribution: AACP `0x0053` and `0x0055` are real packets, but they appear to be part of the AACP init/post-init stream rather than a persistent raw ATT write or `0x0052` commit path.
 
-- direct `0x002A` write-command
-- sibling `0x0026` write-command
-- sibling `0x0021` write-command
-- sibling `0x0028` write-request
-- notification/indication combinations around `0x002B`, `0x002F`, `0x0032`, `0x0035`, and `0x0038`
+The observed `0x0053` shape was:
 
-v17 therefore focuses on the only new clue from v15: an AACP packet with command/message `0x0052` observed after the full indication setup.
+- payload length: 134 bytes
+- first word: `0x0084`, matching the remaining 132 bytes
+- prefix after length: `02 00 02 02`
+- vector body: 32 little-endian float32 values, all `0.5`
 
-The probe:
+The observed `0x0055` payload was `01 01 00 19`.
 
-1. Attributes which CCCD enable causes AACP `0x0052`, including the previously untested `0x0022` notify path for `0x0021`.
-2. Sends small AACP `0x0052` status/query variants and reads `0x002A` after each.
-3. Stages ATT writes, then sends AACP `0x0052` variants as possible commit/status triggers.
-4. Sends ATT Handle Value Confirmation `0x1E` whenever an ATT indication is observed.
+v18 therefore focuses on attribution and safe no-op verification:
+
+1. Runs an AACP init matrix to determine which init/notification-request variant produces `0x0053`, `0x0055`, and `0x0017`.
+2. Captures `0x0053`/`0x0055` from the init stream and sends only exact no-op echoes, reading `0x002A` after each.
+3. Fully drains AACP before enabling ATT notify CCCDs, so stale post-init packets are not misattributed to `0x0022` or `0x002B`.
+4. Decodes the current `0x002A` hearing config shape without attempting any new value mutation.
 
 The app still relies on the existing LibrePods Xposed module being active in `com.android.bluetooth`. It does not install or replace the Xposed module.
 
@@ -39,9 +40,4 @@ gradle --no-daemon :app:assembleDebug :app:assembleRelease \
   -PAIRPODS_PROBE_KEY_PASSWORD=android
 ```
 
-APKs are uploaded as the `airpods-control-probe-v17-apks` artifact.
-
-
-## v17 notes
-
-v17 pivots from the failed AACP 0x52 commit idea to the real v16 signal: AACP 0x0053 profile/vector packets, AACP 0x0055 status packets, and large AACP 0x0017 HID/service descriptor traffic after enabling the notify path. It performs deeper passive capture and only no-op exact echoes of observed 0x53/0x55 packets.
+APKs are uploaded as the `airpods-control-probe-v18-apks` artifact.

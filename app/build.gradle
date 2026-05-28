@@ -12,7 +12,7 @@ android {
         minSdk 26
         targetSdk 35
         versionCode 17
-        versionName 'v17-github-runner'
+        versionName 'v18-github-runner'
     }
 
 
