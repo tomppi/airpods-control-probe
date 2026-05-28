@@ -458,6 +458,10 @@ final class AacpV19Probe {
         }
     }
 
+    private void log(String line) {
+        if (this.log != null) this.log.log(line);
+    }
+
     @SuppressLint("MissingPermission")
     private String safeName(BluetoothDevice d) {
         try {
