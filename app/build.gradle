@@ -11,8 +11,8 @@ android {
         applicationId 'dev.tomppi.airpodsprobe'
         minSdk 26
         targetSdk 35
-        versionCode 15
-        versionName 'v15-github-runner'
+        versionCode 16
+        versionName 'v16-github-runner'
     }
 
 
