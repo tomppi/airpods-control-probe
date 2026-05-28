@@ -3,15 +3,15 @@ plugins {
 }
 
 android {
-    namespace 'com.airpodsprobe.v24'
+    namespace 'com.airpodsprobe.v25'
     compileSdk 35
 
     defaultConfig {
-        applicationId 'com.airpodsprobe.v24'
+        applicationId 'com.airpodsprobe.v25'
         minSdk 29
         targetSdk 35
-        versionCode 24
-        versionName '24.0'
+        versionCode 25
+        versionName '25.0'
     }
 
     compileOptions {
