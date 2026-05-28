@@ -3,6 +3,7 @@ package dev.tomppi.airpodsprobe;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
 import android.os.Build;
+import android.os.ParcelUuid;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -16,10 +17,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.UUID;
 
 final class AirPodsProbe {
     private static final int CONNECT_TIMEOUT_MS = 6000;
     private static final int READ_TIMEOUT_MS = 3500;
+    private static final int TYPE_RFCOMM = 1;
+    private static final int TYPE_L2CAP = 3;
+    private static final UUID UUID_AIRPODS_471 = UUID.fromString("4715650b-5e9d-4ac2-b898-a4fc0aa5df78");
+    private static final UUID UUID_AIRPODS_74EC = UUID.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a");
 
     private final ProbeLog log;
 
@@ -42,6 +48,7 @@ final class AirPodsProbe {
             testPsm(device, 31, true, true, null);
             testAttWhileAacpHeldOpen(device);
             testAttAfterAacpInit(device);
+            testUuidDiscovery(device);
         }
 
         if (tryRaw) {
@@ -141,6 +148,50 @@ final class AirPodsProbe {
         } finally {
             closeQuietly(aacpSocket);
             log.line("AACP PSM 4097 held-open socket closed.");
+        }
+    }
+
+
+    private void testUuidDiscovery(BluetoothDevice device) {
+        log.line("--- Testing UUID/SDP-resolved sockets for AirPods custom services ---");
+        try {
+            android.os.ParcelUuid[] uuids = device.getUuids();
+            if (uuids == null || uuids.length == 0) {
+                log.line("device.getUuids() returned no UUIDs. Pair/reconnect or run Bluetooth settings discovery first.");
+            } else {
+                log.line("BluetoothDevice.getUuids():");
+                for (android.os.ParcelUuid u : uuids) {
+                    log.line("  " + u.getUuid());
+                }
+            }
+        } catch (Throwable t) {
+            log.line("Could not read device UUIDs: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+
+        testUuidSocket(device, UUID_AIRPODS_74EC, "AirPods custom UUID 74ec...", false);
+        testUuidSocket(device, UUID_AIRPODS_471, "AirPods custom UUID 471...", true);
+    }
+
+    private void testUuidSocket(BluetoothDevice device, UUID uuid, String label, boolean tryAttReads) {
+        log.line("--- Testing " + label + " / " + uuid + " ---");
+        SocketAttempt attempt = tryUuidStrategies(device, uuid);
+        if (attempt.socket == null) {
+            log.line(label + " failed with every UUID/SDP strategy.");
+            return;
+        }
+        log.line(label + " connected using " + attempt.strategy + ".");
+        try {
+            if (tryAttReads) {
+                log.line("Trying safe ATT read probes on this UUID-connected socket.");
+                attRead(attempt.socket, 0x0018, "TRANSPARENCY_CONFIG");
+                attRead(attempt.socket, 0x001B, "LOUD_SOUND_REDUCTION");
+                attRead(attempt.socket, 0x002A, "HEARING_AID_CONFIG");
+            } else {
+                log.line("Connected only. This likely maps to the already-working AACP service; no payload sent.");
+            }
+        } finally {
+            closeQuietly(attempt.socket);
+            log.line(label + " socket closed.");
         }
     }
 
@@ -303,6 +354,47 @@ final class AirPodsProbe {
         }
         return new SocketAttempt(null, null);
     }
+
+    private SocketAttempt tryUuidStrategies(BluetoothDevice device, UUID uuid) {
+        List<SocketFactory> factories = new ArrayList<>();
+        factories.add(new SocketFactory("public createRfcommSocketToServiceRecord(uuid)", () -> device.createRfcommSocketToServiceRecord(uuid)));
+        factories.add(new SocketFactory("public createInsecureRfcommSocketToServiceRecord(uuid)", () -> device.createInsecureRfcommSocketToServiceRecord(uuid)));
+        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=-1, secure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, true, true, -1, uuid)));
+        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=-1, insecure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, false, false, -1, uuid)));
+        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=0, secure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, true, true, 0, uuid)));
+        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=0, insecure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, false, false, 0, uuid)));
+        factories.add(new SocketFactory("hidden createSocket(TYPE_RFCOMM, uuid, port=-1, secure)", () -> invokeCreateSocket(device, TYPE_RFCOMM, -1, true, true, -1, uuid)));
+        factories.add(new SocketFactory("hidden createSocket(TYPE_RFCOMM, uuid, port=-1, insecure)", () -> invokeCreateSocket(device, TYPE_RFCOMM, -1, false, false, -1, uuid)));
+
+        for (SocketFactory factory : factories) {
+            BluetoothSocket socket = null;
+            try {
+                log.line("Trying " + factory.name + " for UUID " + uuid + ".");
+                socket = factory.create();
+                if (socket == null) {
+                    log.line(factory.name + " returned null.");
+                    continue;
+                }
+                boolean ok = connectWithTimeout(socket, CONNECT_TIMEOUT_MS);
+                if (ok) {
+                    return new SocketAttempt(socket, factory.name);
+                }
+                closeQuietly(socket);
+            } catch (Throwable t) {
+                log.line(factory.name + " failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                closeQuietly(socket);
+            }
+        }
+        return new SocketAttempt(null, null);
+    }
+
+    private BluetoothSocket invokeCreateSocket(BluetoothDevice device, int type, int fd, boolean auth, boolean encrypt, int port, UUID uuid) throws Exception {
+        Method m = BluetoothDevice.class.getDeclaredMethod("createSocket", int.class, int.class, boolean.class, boolean.class, int.class, ParcelUuid.class);
+        m.setAccessible(true);
+        Object result = m.invoke(device, type, fd, auth, encrypt, port, new ParcelUuid(uuid));
+        return (BluetoothSocket) result;
+    }
+
 
     private BluetoothSocket invokeSocket(BluetoothDevice device, String methodName, int psm) throws Exception {
         Method m = BluetoothDevice.class.getMethod(methodName, int.class);

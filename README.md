@@ -79,3 +79,12 @@ This version adds an important test: it keeps the working AACP PSM 4097 socket o
 ## v5 update
 
 Adds a LibrePods-style AACP init probe: the app opens AACP PSM 4097, sends the known startup packet sequence (handshake, set feature flags, request notifications), keeps AACP open, and then retries ATT PSM 31. This helps determine whether ATT 31 requires an AACP init sequence before it becomes reachable.
+
+## v6 update
+
+Adds UUID/SDP-resolved socket tests for the two AirPods custom BR/EDR UUIDs observed in dumps:
+
+- `74ec2172-0bad-4d01-8f77-997b2be0722a`
+- `4715650b-5e9d-4ac2-b898-a4fc0aa5df78`
+
+The app now logs `BluetoothDevice.getUuids()` and tries RFCOMM and hidden `createSocket(..., ParcelUuid)` strategies so we can check whether Android can resolve a working channel by UUID instead of hardcoding PSM `31`.
