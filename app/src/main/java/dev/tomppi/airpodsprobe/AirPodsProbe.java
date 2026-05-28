@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -34,7 +35,7 @@ final class AirPodsProbe {
         this.log = log;
     }
 
-    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex, boolean doStability) {
+    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex, boolean doStability, boolean doHearingWriteVerify) {
         log.line("=== AirPods control probe started ===");
         log.line("Device: " + safeName(device) + " / " + device.getAddress());
         log.line("This app relies on the existing LibrePods Xposed module being active in com.android.bluetooth.");
@@ -67,6 +68,10 @@ final class AirPodsProbe {
 
         if (doStability) {
             testDisconnectStability(device);
+        }
+
+        if (doHearingWriteVerify) {
+            testHearingAidNoOpWriteVerifier(device);
         }
 
         log.line("=== Probe finished ===");
@@ -174,6 +179,73 @@ final class AirPodsProbe {
         } finally {
             closeQuietly(attSocket);
             closeQuietly(aacpSocket);
+        }
+    }
+
+
+    private void testHearingAidNoOpWriteVerifier(BluetoothDevice device) {
+        log.line("--- Hearing Aid 0x2A no-op write verifier ---");
+        log.line("This test is intended to be safe: it reads handle 0x002A, writes the exact same value back, then reads it again.");
+        log.line("It does not intentionally change hearing-aid values. It only verifies whether ATT write-to-0x2A itself is accepted and stable.");
+        BluetoothSocket aacpSocket = null;
+        BluetoothSocket attSocket = null;
+        try {
+            SocketAttempt aacp = tryAllStrategies(device, 4097);
+            aacpSocket = aacp.socket;
+            if (aacpSocket == null) {
+                log.line("Hearing verifier aborted: could not open AACP PSM 4097.");
+                return;
+            }
+            log.line("Hearing verifier: AACP PSM 4097 connected using " + aacp.strategy + ". Sending init sequence.");
+            runAacpInitSequence(aacpSocket);
+            log.line("Hearing verifier: AACP init sent. Waiting 1000 ms before ATT open.");
+            sleep(1000);
+
+            SocketAttempt att = tryAttPostInitPreferred(device);
+            attSocket = att.socket;
+            if (attSocket == null) {
+                log.line("Hearing verifier aborted: ATT PSM 31 did not connect after AACP init.");
+                return;
+            }
+            log.line("Hearing verifier: ATT PSM 31 connected using " + att.strategy + ".");
+
+            byte[] before = attReadValue(attSocket, 0x002A, "HEARING_AID_CONFIG before no-op write");
+            if (before == null) {
+                log.line("Hearing verifier aborted: could not read 0x002A before write.");
+                return;
+            }
+            log.line("Hearing verifier: 0x002A value length before write = " + before.length + " bytes.");
+            log.line("Hearing verifier: writing the exact same 0x002A value back as a no-op.");
+            byte[] writeResponse = attWriteRequest(attSocket, 0x002A, before, "HEARING_AID_CONFIG no-op write");
+            if (writeResponse == null) {
+                log.line("Hearing verifier: no write response for no-op 0x002A write.");
+            } else if (writeResponse.length > 0 && (writeResponse[0] & 0xFF) == 0x13) {
+                log.line("Hearing verifier: AirPods returned ATT Write Response 0x13 for no-op write.");
+            } else {
+                log.line("Hearing verifier: unexpected no-op write response: " + Hex.bytes(writeResponse, writeResponse.length));
+            }
+
+            sleep(600);
+            byte[] after = attReadValue(attSocket, 0x002A, "HEARING_AID_CONFIG after no-op write");
+            if (after == null) {
+                log.line("Hearing verifier: could not read 0x002A after no-op write.");
+                return;
+            }
+            boolean same = Arrays.equals(before, after);
+            log.line("Hearing verifier: readback after no-op write is " + (same ? "IDENTICAL" : "DIFFERENT") + ".");
+            if (!same) {
+                log.line("Hearing verifier WARNING: no-op write changed the 0x2A value. Before=" + Hex.bytes(before, before.length));
+                log.line("Hearing verifier WARNING: after=" + Hex.bytes(after, after.length));
+            } else {
+                log.line("Hearing verifier result: ATT write mechanism works at protocol level for an unchanged 0x2A blob.");
+                log.line("If LibrePods changed hearing-aid values still do not persist, the issue is likely payload format / commit / save semantics, not basic ATT connectivity.");
+            }
+        } catch (Throwable t) {
+            log.line("Hearing verifier failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
+        } finally {
+            closeQuietly(attSocket);
+            closeQuietly(aacpSocket);
+            log.line("Hearing verifier sockets closed.");
         }
     }
 
@@ -405,6 +477,53 @@ final class AirPodsProbe {
             }
         } catch (Exception e) {
             log.line(String.format(Locale.US, "ATT read 0x%04X failed: %s: %s", handle, e.getClass().getSimpleName(), e.getMessage()));
+        }
+    }
+
+
+    private byte[] attReadValue(BluetoothSocket socket, int handle, String name) {
+        byte[] request = new byte[] {0x0A, (byte) (handle & 0xFF), (byte) ((handle >> 8) & 0xFF)};
+        log.line(String.format(Locale.US, "ATT read %s handle 0x%04X request: %s", name, handle, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            byte[] response = readWithTimeout(socket, READ_TIMEOUT_MS);
+            if (response == null) {
+                log.line(String.format(Locale.US, "ATT read value 0x%04X: no response within %d ms", handle, READ_TIMEOUT_MS));
+                return null;
+            }
+            int opcode = response.length > 0 ? (response[0] & 0xFF) : -1;
+            log.line(String.format(Locale.US, "ATT read value 0x%04X response opcode 0x%02X: %s", handle, opcode, Hex.bytes(response, response.length)));
+            if (opcode != 0x0B) return null;
+            byte[] value = new byte[Math.max(0, response.length - 1)];
+            if (value.length > 0) System.arraycopy(response, 1, value, 0, value.length);
+            log.line(String.format(Locale.US, "ATT read value 0x%04X parsed value: %s", handle, Hex.bytes(value, value.length)));
+            return value;
+        } catch (Exception e) {
+            log.line(String.format(Locale.US, "ATT read value 0x%04X failed: %s: %s", handle, e.getClass().getSimpleName(), e.getMessage()));
+            return null;
+        }
+    }
+
+    private byte[] attWriteRequest(BluetoothSocket socket, int handle, byte[] value, String name) {
+        byte[] request = new byte[3 + value.length];
+        request[0] = 0x12;
+        request[1] = (byte) (handle & 0xFF);
+        request[2] = (byte) ((handle >> 8) & 0xFF);
+        System.arraycopy(value, 0, request, 3, value.length);
+        log.line(String.format(Locale.US, "ATT write %s handle 0x%04X request: %s", name, handle, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            byte[] response = readWithTimeout(socket, READ_TIMEOUT_MS);
+            if (response == null) {
+                log.line(String.format(Locale.US, "ATT write 0x%04X: no response within %d ms", handle, READ_TIMEOUT_MS));
+                return null;
+            }
+            int opcode = response.length > 0 ? (response[0] & 0xFF) : -1;
+            log.line(String.format(Locale.US, "ATT write 0x%04X response opcode 0x%02X: %s", handle, opcode, Hex.bytes(response, response.length)));
+            return response;
+        } catch (Exception e) {
+            log.line(String.format(Locale.US, "ATT write 0x%04X failed: %s: %s", handle, e.getClass().getSimpleName(), e.getMessage()));
+            return null;
         }
     }
 

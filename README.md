@@ -95,7 +95,7 @@ The app now logs `BluetoothDevice.getUuids()` and tries RFCOMM and hidden `creat
 Adds runtime enumeration of BluetoothDevice socket methods and dynamic reflection attempts for ROM-specific `createSocket` signatures.
 
 
-## v8 stability/disconnect lab
+## v9 stability/disconnect lab
 
 This version adds a read-only stability mode designed for debugging disconnects after the ATT channel becomes reachable. It:
 
@@ -106,3 +106,8 @@ This version adds a read-only stability mode designed for debugging disconnects 
 5. Closes ATT first, then AACP, and logs Bluetooth ACL disconnect broadcasts.
 
 The goal is to determine whether disconnects happen during ATT reads, when sockets are closed, or from Android Bluetooth profile/ACL events.
+
+
+## v9 hearing-aid no-op write verifier
+
+v9 adds a safe 0x2A verifier for the hearing-aid configuration path. It opens AACP PSM 4097, sends the init sequence, opens ATT PSM 31, reads handle 0x002A, writes the exact same value back, then reads 0x002A again and compares the bytes. This does not intentionally change hearing settings; it verifies whether the basic ATT write mechanism works independently of LibrePods' hearing-aid payload mapping or commit/save semantics.

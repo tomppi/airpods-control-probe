@@ -39,6 +39,7 @@ public final class MainActivity extends Activity {
     private CheckBox probeAtt;
     private CheckBox sendRaw;
     private CheckBox stabilityTest;
+    private CheckBox hearingWriteVerifier;
     private EditText rawHex;
     private ProbeLog log;
     private BroadcastReceiver bluetoothReceiver;
@@ -143,8 +144,13 @@ public final class MainActivity extends Activity {
 
         stabilityTest = new CheckBox(this);
         stabilityTest.setText("Run stability/disconnect lab: AACP init + ATT hold + repeated safe reads");
-        stabilityTest.setChecked(true);
+        stabilityTest.setChecked(false);
         root.addView(stabilityTest, new LinearLayout.LayoutParams(-1, -2));
+
+        hearingWriteVerifier = new CheckBox(this);
+        hearingWriteVerifier.setText("Run hearing-aid 0x2A no-op write verifier (safe read → same-value write → readback)");
+        hearingWriteVerifier.setChecked(true);
+        root.addView(hearingWriteVerifier, new LinearLayout.LayoutParams(-1, -2));
 
         sendRaw = new CheckBox(this);
         sendRaw.setText("Advanced: send raw hex to PSM 31 once");
@@ -244,7 +250,8 @@ public final class MainActivity extends Activity {
                 probeAtt.isChecked(),
                 sendRaw.isChecked(),
                 rawHex.getText().toString(),
-                stabilityTest.isChecked()
+                stabilityTest.isChecked(),
+                hearingWriteVerifier.isChecked()
         ), "airpods-probe-thread").start();
     }
 
