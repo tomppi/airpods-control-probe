@@ -71,6 +71,11 @@ GPL-3.0-or-later. This project is intended to interoperate with LibrePods and to
 This repo uses `android-actions/setup-android@v3` before calling `sdkmanager`. This is required on GitHub-hosted runners because `sdkmanager` may not be on PATH by default.
 
 
-## v4 note
+## v5 note
 
 This version adds an important test: it keeps the working AACP PSM 4097 socket open while trying to connect ATT PSM 31. This distinguishes "PSM 31 is globally unreachable" from "PSM 31 only works after/while the AACP session is open".
+
+
+## v5 update
+
+Adds a LibrePods-style AACP init probe: the app opens AACP PSM 4097, sends the known startup packet sequence (handshake, set feature flags, request notifications), keeps AACP open, and then retries ATT PSM 31. This helps determine whether ATT 31 requires an AACP init sequence before it becomes reachable.

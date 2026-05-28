@@ -41,6 +41,7 @@ final class AirPodsProbe {
             testPsm(device, 31, true, false, null);
             testPsm(device, 31, true, true, null);
             testAttWhileAacpHeldOpen(device);
+            testAttAfterAacpInit(device);
         }
 
         if (tryRaw) {
@@ -140,6 +141,107 @@ final class AirPodsProbe {
         } finally {
             closeQuietly(aacpSocket);
             log.line("AACP PSM 4097 held-open socket closed.");
+        }
+    }
+
+
+    private void testAttAfterAacpInit(BluetoothDevice device) {
+        log.line("--- Testing PSM/channel 31 after LibrePods-style AACP init ---");
+        BluetoothSocket aacpSocket = null;
+        try {
+            log.line("Opening AACP PSM 4097, sending init packets, then probing ATT PSM 31 while AACP stays open.");
+            SocketAttempt aacp = tryAllStrategies(device, 4097);
+            aacpSocket = aacp.socket;
+            if (aacpSocket == null) {
+                log.line("Could not open AACP PSM 4097; skipping AACP-init ATT test.");
+                return;
+            }
+            log.line("AACP PSM 4097 connected using " + aacp.strategy + ". Sending init sequence.");
+            runAacpInitSequence(aacpSocket);
+            log.line("AACP init sequence sent. Waiting 1000 ms before ATT probe.");
+            sleep(1000);
+
+            SocketAttempt att = tryAllStrategies(device, 31);
+            if (att.socket == null) {
+                log.line("ATT PSM 31 still failed after AACP init sequence.");
+                return;
+            }
+            log.line("ATT PSM 31 connected after AACP init using " + att.strategy + ". Running safe reads.");
+            try {
+                attRead(att.socket, 0x0018, "TRANSPARENCY_CONFIG");
+                attRead(att.socket, 0x001B, "LOUD_SOUND_REDUCTION");
+                attRead(att.socket, 0x002A, "HEARING_AID_CONFIG");
+            } finally {
+                closeQuietly(att.socket);
+                log.line("ATT PSM 31 socket closed.");
+            }
+        } finally {
+            closeQuietly(aacpSocket);
+            log.line("AACP PSM 4097 AACP-init socket closed.");
+        }
+    }
+
+    private void runAacpInitSequence(BluetoothSocket socket) {
+        // These are the same safe startup packet shapes used by LibrePods' AACPManager:
+        // handshake, SET_FEATURE_FLAGS, then REQUEST_NOTIFICATIONS.
+        // The latter two are wrapped in the AACP data header 04 00 04 00.
+        byte[] handshake = new byte[] {
+                0x00, 0x00, 0x04, 0x00,
+                0x01, 0x00, 0x02, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00
+        };
+        byte[] setFeatureFlags = aacpData(new byte[] {
+                0x4D, 0x00,
+                (byte) 0xD7, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00
+        });
+        byte[] requestNotifications = aacpData(new byte[] {
+                0x0F, 0x00,
+                (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF
+        });
+
+        sendAacpInitPacket(socket, "handshake", handshake, true);
+        sleep(250);
+        sendAacpInitPacket(socket, "set feature flags", setFeatureFlags, true);
+        sleep(250);
+        sendAacpInitPacket(socket, "request notifications", requestNotifications, true);
+        sleep(500);
+        drainAacpResponses(socket, 2);
+    }
+
+    private byte[] aacpData(byte[] payload) {
+        byte[] out = new byte[payload.length + 4];
+        out[0] = 0x04;
+        out[1] = 0x00;
+        out[2] = 0x04;
+        out[3] = 0x00;
+        System.arraycopy(payload, 0, out, 4, payload.length);
+        return out;
+    }
+
+    private void sendAacpInitPacket(BluetoothSocket socket, String label, byte[] packet, boolean tryReadResponse) {
+        log.line("AACP init send " + label + ": " + Hex.bytes(packet, packet.length));
+        try {
+            writeRaw(socket, packet);
+            if (tryReadResponse) {
+                byte[] response = readWithTimeout(socket, 900);
+                if (response == null) {
+                    log.line("AACP init " + label + ": no immediate response.");
+                } else {
+                    log.line("AACP init " + label + " response: " + Hex.bytes(response, response.length));
+                }
+            }
+        } catch (IOException e) {
+            log.line("AACP init " + label + " write failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private void drainAacpResponses(BluetoothSocket socket, int maxPackets) {
+        for (int i = 0; i < maxPackets; i++) {
+            byte[] response = readWithTimeout(socket, 450);
+            if (response == null) return;
+            log.line("AACP extra response " + (i + 1) + ": " + Hex.bytes(response, response.length));
         }
     }
 
