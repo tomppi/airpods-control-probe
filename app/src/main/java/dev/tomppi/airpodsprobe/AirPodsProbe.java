@@ -83,12 +83,16 @@ final class AirPodsProbe {
         try {
             if (rawPayload != null) {
                 log.line("Sending raw payload to PSM " + psm + ": " + Hex.bytes(rawPayload, rawPayload.length));
-                writeRaw(attempt.socket, rawPayload);
-                byte[] response = readWithTimeout(attempt.socket, READ_TIMEOUT_MS);
-                if (response != null) {
-                    log.line("Raw response: " + Hex.bytes(response, response.length));
-                } else {
-                    log.line("Raw payload: no response within " + READ_TIMEOUT_MS + " ms.");
+                try {
+                    writeRaw(attempt.socket, rawPayload);
+                    byte[] response = readWithTimeout(attempt.socket, READ_TIMEOUT_MS);
+                    if (response != null) {
+                        log.line("Raw response: " + Hex.bytes(response, response.length));
+                    } else {
+                        log.line("Raw payload: no response within " + READ_TIMEOUT_MS + " ms.");
+                    }
+                } catch (IOException e) {
+                    log.line("Raw payload write failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 }
             } else if (attProbe) {
                 attRead(attempt.socket, 0x0018, "TRANSPARENCY_CONFIG");
