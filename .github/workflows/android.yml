@@ -1,8 +1,9 @@
-name: Build Android probe APK
+name: Build AirPods Control Probe
 
 on:
   workflow_dispatch:
   push:
+    branches: [ main, master ]
   pull_request:
 
 jobs:
@@ -10,6 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      ANDROID_COMPILE_SDK: '35'
+      ANDROID_BUILD_TOOLS: '35.0.0'
 
     steps:
       - name: Checkout
@@ -27,13 +31,49 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.10.2'
 
-      - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug
+      - name: Show tool versions
+        run: |
+          java -version
+          gradle --version
+          sdkmanager --version
 
-      - name: Upload debug APK
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager \
+            "platforms;android-${ANDROID_COMPILE_SDK}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "platform-tools"
+
+      - name: Create CI release key
+        run: |
+          keytool -genkeypair -v \
+            -storetype JKS \
+            -keystore "$GITHUB_WORKSPACE/ci-release-key.jks" \
+            -storepass android \
+            -keypass android \
+            -alias airpodsprobe \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=AirPods Probe CI,O=AirPods Probe,C=US"
+
+      - name: Build debug and release APKs
+        run: |
+          gradle --no-daemon :app:assembleDebug :app:assembleRelease \
+            -PAIRPODS_PROBE_KEYSTORE="$GITHUB_WORKSPACE/ci-release-key.jks" \
+            -PAIRPODS_PROBE_KEYSTORE_PASSWORD=android \
+            -PAIRPODS_PROBE_KEY_ALIAS=airpodsprobe \
+            -PAIRPODS_PROBE_KEY_PASSWORD=android
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: airpods-control-probe-v15-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: airpods-control-probe-v15-apks
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk

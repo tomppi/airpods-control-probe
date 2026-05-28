@@ -2,7 +2,7 @@
 
 GitHub-runner-ready Android probe app for the AirPods Pro hearing-aid save investigation.
 
-This repo is intentionally set up for GitHub Actions instead of requiring a local Android build environment. Push the repo to GitHub, open **Actions**, run **Build Android probe APK**, then download the uploaded `airpods-control-probe-v15-debug-apk` artifact.
+This repo is intentionally set up for GitHub Actions instead of requiring a local Android build environment. Push the repo to GitHub, open **Actions**, run **Build Android probe APK**, then download the uploaded `airpods-control-probe-v15-apks` artifact.
 
 ## What v15 changes from v14
 
@@ -27,7 +27,7 @@ The workflow is included at:
 .github/workflows/android.yml
 ```
 
-It uses:
+It builds both debug and CI-signed release APKs on GitHub-hosted runners. It uses:
 
 - Ubuntu GitHub-hosted runner
 - JDK 17
