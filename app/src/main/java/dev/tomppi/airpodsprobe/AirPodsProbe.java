@@ -40,6 +40,7 @@ final class AirPodsProbe {
         if (doAtt) {
             testPsm(device, 31, true, false, null);
             testPsm(device, 31, true, true, null);
+            testAttWhileAacpHeldOpen(device);
         }
 
         if (tryRaw) {
@@ -104,6 +105,41 @@ final class AirPodsProbe {
         } finally {
             closeQuietly(attempt.socket);
             log.line("PSM " + psm + " socket closed.");
+        }
+    }
+
+    private void testAttWhileAacpHeldOpen(BluetoothDevice device) {
+        log.line("--- Testing PSM/channel 31 as ATT while AACP PSM 4097 remains open ---");
+        SocketAttempt aacp = null;
+        BluetoothSocket aacpSocket = null;
+        try {
+            log.line("Opening AACP PSM 4097 and keeping it open during ATT probe.");
+            aacp = tryAllStrategies(device, 4097);
+            aacpSocket = aacp.socket;
+            if (aacpSocket == null) {
+                log.line("Could not open AACP PSM 4097; skipping held-open ATT test.");
+                return;
+            }
+            log.line("AACP PSM 4097 held open using " + aacp.strategy + ". Waiting 800 ms before ATT probe.");
+            sleep(800);
+
+            SocketAttempt att = tryAllStrategies(device, 31);
+            if (att.socket == null) {
+                log.line("ATT PSM 31 still failed while AACP was held open.");
+                return;
+            }
+            log.line("ATT PSM 31 connected while AACP was held open using " + att.strategy + ". Running safe reads.");
+            try {
+                attRead(att.socket, 0x0018, "TRANSPARENCY_CONFIG");
+                attRead(att.socket, 0x001B, "LOUD_SOUND_REDUCTION");
+                attRead(att.socket, 0x002A, "HEARING_AID_CONFIG");
+            } finally {
+                closeQuietly(att.socket);
+                log.line("ATT PSM 31 socket closed.");
+            }
+        } finally {
+            closeQuietly(aacpSocket);
+            log.line("AACP PSM 4097 held-open socket closed.");
         }
     }
 
