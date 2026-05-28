@@ -8,7 +8,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="AACP v27 Probe"
+        android:label="AACP v28 Control"
         android:theme="@style/AppTheme"
         android:supportsRtl="true">
         <activity
