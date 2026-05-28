@@ -1,20 +1,34 @@
-# AirPods AACP v22 Probe
+# AirPods AACP v23 Probe
 
-This Android probe is the next step after the v21 run.
+This Android probe is the next step after the v22 run.
 
 It relies on the existing LibrePods Xposed module already being active in `com.android.bluetooth`. It does **not** install, replace, or modify the Xposed module.
 
-## Why v22 exists
+## Why v23 exists
 
-v21 behaved safely: it did **not** send AACP `0x0054`, because it did not capture a current-session `0x0053` payload.
+v22 successfully captured the current-session AACP `0x0053` vector on the clean v20 winning path:
 
-The important detail is timing. In the v20 `CCCD 0x0022 only` run, the first `0x0053`/`0x0055` pair appeared after the post-CCCD final ATT reads and final deep AACP drain. v21 stopped at the earlier post-CCCD drain when no `0x0053` had appeared yet.
+```text
+CCCD 0x0022 only -> current-session 0x0053 -> 0x0055
+```
 
-v22 keeps the same no-stale safety rule, but replays the fuller v20 timing before deciding there is no current-session vector.
+The captured `0x0053` looked internally consistent:
 
-## What v22 does
+```text
+84 00 02 00 02 02 <32 little-endian float32 values, all 0.5>
+```
 
-For up to two safe attempts, v22:
+v22 then sent a full-payload `0x0054` no-op echo:
+
+```text
+04 00 04 00 54 00 <captured 0x0053 payload including 84 00>
+```
+
+That produced no direct `0x0055`, `0x0053`, or `0x0052` response, and ATT `0x002A` did not change. The next safest hypothesis is that `0x0054` may want the `0x0053` body **without** the leading 2-byte reported length word.
+
+## What v23 does
+
+For up to two safe capture attempts, v23:
 
 1. Runs the normal AACP init:
    - handshake,
@@ -22,34 +36,36 @@ For up to two safe attempts, v22:
    - AACP `0x000F` notification request `FF FF FF FF`.
 2. Opens ATT PSM `31`.
 3. Performs pre-CCCD ATT reads of `0x0021`, `0x0024`, and `0x002A`.
-4. Enables only the v20 winning CCCD:
+4. Enables only the v20/v22 winning CCCD:
    - ATT handle `0x0022 = 01 00`.
 5. Drains AACP directly after the CCCD write.
-6. Continues past the v21 abort point by doing the v20-style post-CCCD ATT reads:
+6. Performs the v20-style post-CCCD ATT reads:
    - `0x0021`, `0x0024`, and `0x002A` again.
 7. Performs a longer final AACP capture drain.
-8. Sends exactly one AACP `0x0054` no-op echo **only if** a current-session `0x0053` payload was captured.
-9. Watches for post-`0x0054` AACP `0x0055`, `0x0053`, `0x0052`, and ATT `0x002A` changes.
+8. If a current-session `0x0053` payload is captured and its leading length word equals `payloadLen - 2`, derives a body-only no-op payload by stripping those first two bytes.
+9. Sends exactly one setter-like AACP frame:
+
+```text
+04 00 04 00 54 00 <captured 0x0053 payload without the first two length bytes>
+```
+
+10. Watches for direct post-`0x0054` AACP `0x0055`, `0x0053`, `0x0052`, and ATT `0x002A` changes.
+11. Sends one benign post-`0x0054` notification refresh request, the same `0x000F FF FF FF FF` used during init, and logs that stream separately. This refresh is **not** counted as a direct `0x0054` ack.
 
 It does **not** send AACP `0x0052`, `0x0053`, or `0x0055` candidates.
 
-The no-op echo frame shape remains:
-
-```text
-04 00 04 00 54 00 <captured current-session 0x0053 payload>
-```
-
-If no current-session `0x0053` appears after the fuller replay, v22 aborts without sending `0x0054`.
+If no current-session `0x0053` appears after the fuller replay, v23 aborts without sending `0x0054`.
 
 ## Success signals
 
-The strongest signal is a post-`0x0054` AACP `0x0055` response.
+The strongest signal is a direct post-`0x0054` AACP `0x0055` response.
 
 The app also logs:
 
-- whether a post-`0x0054` `0x0053` refresh appeared,
-- whether a post-`0x0054` `0x0052` status appeared,
-- whether ATT `0x002A` changed after the no-op echo,
+- whether a direct post-`0x0054` `0x0053` refresh appeared,
+- whether a direct post-`0x0054` `0x0052` status appeared,
+- whether ATT `0x002A` changed after the body-only no-op,
+- whether the post-refresh `0x0053` equals the selected captured `0x0053`,
 - decoded payloads for first relevant packets.
 
 ## Build locally
@@ -75,13 +91,13 @@ The included workflow runs on GitHub-hosted `ubuntu-latest`, installs Java 17, A
 1. Pair the AirPods with the Android device.
 2. Make sure the LibrePods Xposed module is active in `com.android.bluetooth`.
 3. Install the debug APK.
-4. Launch **AACP v22 Probe**.
+4. Launch **AACP v23 Probe**.
 5. Enter or confirm the AirPods MAC address.
-6. Tap **Run v22 probe**.
+6. Tap **Run v23 probe**.
 7. Use **Copy log** when the probe finishes.
 
 ## Notes
 
 - This is a reverse-engineering probe. It may fail on firmware or Android Bluetooth stack variants.
 - The app uses reflection to call hidden `BluetoothDevice.createL2capSocket(int)` / `createInsecureL2capSocket(int)` because the previous probes used those exact paths.
-- The only setter-like AACP frame sent by v22 is one `0x0054` no-op echo using a current-session captured `0x0053` payload.
+- The only setter-like AACP frame sent by v23 is one `0x0054` body-only no-op using a current-session captured `0x0053` payload.
