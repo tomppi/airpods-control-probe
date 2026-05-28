@@ -1,123 +1,44 @@
-# AirPods Control Probe
+# AirPods Control Probe v15
 
-A small diagnostic Android app for testing AirPods advanced-control channels on Android.
+GitHub-runner-ready Android probe app for the AirPods Pro hearing-aid save investigation.
 
-This is **not** LibrePods and does not replace LibrePods. It is a separate probe app designed to answer one question:
+This repo is intentionally set up for GitHub Actions instead of requiring a local Android build environment. Push the repo to GitHub, open **Actions**, run **Build Android probe APK**, then download the uploaded `airpods-control-probe-v15-debug-apk` artifact.
 
-> Which AirPods control channels and safe read payloads actually work on this phone + AirPods firmware?
+## What v15 changes from v14
 
-## Important
+v14 already proved that direct writes to `0x002A` are acknowledged/sent but readback remains the baseline value. It also mapped the nearby handles and showed:
 
-This app is designed to be used with the **existing LibrePods Xposed/Vector/LSPosed module already enabled** for `com.android.bluetooth`.
+- `0x002A` = read + write-no-response + notify, CCCD `0x002B`
+- `0x002E`, `0x0031`, `0x0034`, `0x0037` = write + indicate command/status-style channels
+- CCCDs for those indication channels are `0x002F`, `0x0032`, `0x0035`, `0x0038`
 
-The probe app itself is not an Xposed module. The existing LibrePods module should still provide the Bluetooth stack hooks, including:
+v15 keeps the v14 robust stale-packet filtering and adds the missing next things to try:
 
-- VendorID/DID spoofing
-- L2CAP channel-mode workaround
+1. Tests the sibling Apple-service write handles `0x0021`, `0x0026`, and `0x0028` as possible input routes while still reading `0x002A` as the state/output value.
+2. Enables all command indication descriptors, including the v14-discovered `0x0038` path that was not part of the earlier command-indication test set.
+3. Runs each route in a fresh AACP + ATT session so one bad write cannot poison the following tests.
+4. Uses a controlled header-preserved mutation: only byte `[4]` is changed to `0x01` when the baseline is long enough.
 
-The app then tries to open and test the AirPods control sockets from userland.
+## Build on GitHub runners
 
-## What it tests
+The workflow is included at:
 
-The app tests these paths:
+```text
+.github/workflows/android.yml
+```
 
-- AACP/main control channel PSM `4097` — connect-only probe
-- ATT-like advanced-settings channel PSM `31`
-- Safe ATT read probes:
-  - handle `0x0018` — transparency/custom transparency config candidate
-  - handle `0x001B` — loud sound reduction candidate
-  - handle `0x002A` — hearing aid config candidate
+It uses:
 
-It tries several socket constructors/strategies:
+- Ubuntu GitHub-hosted runner
+- JDK 17
+- Android SDK setup action
+- Gradle installed by the workflow
+- `gradle :app:assembleDebug`
 
-- hidden `createL2capSocket(psm)`
-- hidden `createInsecureL2capSocket(psm)`
-- public `createL2capChannel(psm)`
-- public `createInsecureL2capChannel(psm)`
+No local Gradle wrapper is required for GitHub Actions.
 
-For ATT, it checks whether the AirPods respond with an ATT read response (`0x0B`) or error response (`0x01`). A timeout means the channel is not actually usable.
+## Runtime notes
 
-## Why this exists
+Install the debug APK on the Android device where the LibrePods Xposed module is already active in `com.android.bluetooth`.
 
-In the tested Samsung setup, LibrePods successfully spoofed the phone DID VendorID to Apple `0x004C`, and the L2CAP hook fired, but the advanced ATT path still failed. This app isolates the ATT/AACP channel behavior from the rest of LibrePods UI/state logic.
-
-## Build with GitHub Actions
-
-1. Create a new GitHub repo.
-2. Upload this repo's files.
-3. Go to **Actions** → **Build AirPods Control Probe** → **Run workflow**.
-4. Download the APK artifact.
-
-## Usage
-
-1. Keep the LibrePods Xposed module enabled for Bluetooth.
-2. Reboot after changing Xposed scope.
-3. Pair/connect your AirPods normally.
-4. Open this app.
-5. Select the AirPods device.
-6. Run the probe.
-7. Copy/share the log.
-
-## Safety
-
-The default probe only performs connection tests and ATT read requests. Avoid raw write payloads unless you know exactly what the bytes do.
-
-## License
-
-GPL-3.0-or-later. This project is intended to interoperate with LibrePods and to keep derivative diagnostic work compatible with LibrePods' license.
-
-## v2 workflow note
-
-This repo uses `android-actions/setup-android@v3` before calling `sdkmanager`. This is required on GitHub-hosted runners because `sdkmanager` may not be on PATH by default.
-
-
-## v5 note
-
-This version adds an important test: it keeps the working AACP PSM 4097 socket open while trying to connect ATT PSM 31. This distinguishes "PSM 31 is globally unreachable" from "PSM 31 only works after/while the AACP session is open".
-
-
-## v5 update
-
-Adds a LibrePods-style AACP init probe: the app opens AACP PSM 4097, sends the known startup packet sequence (handshake, set feature flags, request notifications), keeps AACP open, and then retries ATT PSM 31. This helps determine whether ATT 31 requires an AACP init sequence before it becomes reachable.
-
-## v6 update
-
-Adds UUID/SDP-resolved socket tests for the two AirPods custom BR/EDR UUIDs observed in dumps:
-
-- `74ec2172-0bad-4d01-8f77-997b2be0722a`
-- `4715650b-5e9d-4ac2-b898-a4fc0aa5df78`
-
-The app now logs `BluetoothDevice.getUuids()` and tries RFCOMM and hidden `createSocket(..., ParcelUuid)` strategies so we can check whether Android can resolve a working channel by UUID instead of hardcoding PSM `31`.
-
-
-## v7 notes
-
-Adds runtime enumeration of BluetoothDevice socket methods and dynamic reflection attempts for ROM-specific `createSocket` signatures.
-
-
-## v9 stability/disconnect lab
-
-This version adds a read-only stability mode designed for debugging disconnects after the ATT channel becomes reachable. It:
-
-1. Opens AACP PSM 4097.
-2. Sends the LibrePods-style init sequence.
-3. Opens ATT PSM 31 with `createInsecureL2capSocket(31)`.
-4. Repeatedly reads handles `0x18`, `0x1B`, and `0x2A`.
-5. Closes ATT first, then AACP, and logs Bluetooth ACL disconnect broadcasts.
-
-The goal is to determine whether disconnects happen during ATT reads, when sockets are closed, or from Android Bluetooth profile/ACL events.
-
-
-## v9 hearing-aid no-op write verifier
-
-v9 adds a safe 0x2A verifier for the hearing-aid configuration path. It opens AACP PSM 4097, sends the init sequence, opens ATT PSM 31, reads handle 0x002A, writes the exact same value back, then reads 0x002A again and compares the bytes. This does not intentionally change hearing settings; it verifies whether the basic ATT write mechanism works independently of LibrePods' hearing-aid payload mapping or commit/save semantics.
-
-
-## v14 additions
-
-Adds a hearing-aid 0x2A write-method experiment: read original, no-op/changed write probes, readback after 0/1/3 seconds, Write Request 0x12, Write Command 0x52, Prepare/Execute Write, and restore attempts. Use carefully.
-
-
-## v14 update
-
-Adds header-preserving 0x2A hearing-aid write experiments. These keep `02 00 60 00` unchanged and mutate only data bytes, to test whether LibrePods was changing a header/length field by mistake.
+The app itself does not install or replace the Xposed module. It only opens the same L2CAP/AACP/ATT paths used by the previous probe builds.
