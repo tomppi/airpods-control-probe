@@ -10,8 +10,8 @@ android {
         applicationId = "dev.tomppi.airpodsprobe"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.1.5"
+        versionCode = 7
+        versionName = "0.1.7"
     }
 
     signingConfigs {

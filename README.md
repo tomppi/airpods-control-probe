@@ -88,3 +88,8 @@ Adds UUID/SDP-resolved socket tests for the two AirPods custom BR/EDR UUIDs obse
 - `4715650b-5e9d-4ac2-b898-a4fc0aa5df78`
 
 The app now logs `BluetoothDevice.getUuids()` and tries RFCOMM and hidden `createSocket(..., ParcelUuid)` strategies so we can check whether Android can resolve a working channel by UUID instead of hardcoding PSM `31`.
+
+
+## v7 notes
+
+Adds runtime enumeration of BluetoothDevice socket methods and dynamic reflection attempts for ROM-specific `createSocket` signatures.

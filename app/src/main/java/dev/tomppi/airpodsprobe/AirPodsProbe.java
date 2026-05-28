@@ -22,6 +22,7 @@ import java.util.UUID;
 final class AirPodsProbe {
     private static final int CONNECT_TIMEOUT_MS = 6000;
     private static final int READ_TIMEOUT_MS = 3500;
+    private static final int UUID_CONNECT_TIMEOUT_MS = 3500;
     private static final int TYPE_RFCOMM = 1;
     private static final int TYPE_L2CAP = 3;
     private static final UUID UUID_AIRPODS_471 = UUID.fromString("4715650b-5e9d-4ac2-b898-a4fc0aa5df78");
@@ -154,6 +155,7 @@ final class AirPodsProbe {
 
     private void testUuidDiscovery(BluetoothDevice device) {
         log.line("--- Testing UUID/SDP-resolved sockets for AirPods custom services ---");
+        logBluetoothDeviceSocketMethods();
         try {
             android.os.ParcelUuid[] uuids = device.getUuids();
             if (uuids == null || uuids.length == 0) {
@@ -359,12 +361,6 @@ final class AirPodsProbe {
         List<SocketFactory> factories = new ArrayList<>();
         factories.add(new SocketFactory("public createRfcommSocketToServiceRecord(uuid)", () -> device.createRfcommSocketToServiceRecord(uuid)));
         factories.add(new SocketFactory("public createInsecureRfcommSocketToServiceRecord(uuid)", () -> device.createInsecureRfcommSocketToServiceRecord(uuid)));
-        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=-1, secure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, true, true, -1, uuid)));
-        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=-1, insecure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, false, false, -1, uuid)));
-        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=0, secure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, true, true, 0, uuid)));
-        factories.add(new SocketFactory("hidden createSocket(TYPE_L2CAP, uuid, port=0, insecure)", () -> invokeCreateSocket(device, TYPE_L2CAP, -1, false, false, 0, uuid)));
-        factories.add(new SocketFactory("hidden createSocket(TYPE_RFCOMM, uuid, port=-1, secure)", () -> invokeCreateSocket(device, TYPE_RFCOMM, -1, true, true, -1, uuid)));
-        factories.add(new SocketFactory("hidden createSocket(TYPE_RFCOMM, uuid, port=-1, insecure)", () -> invokeCreateSocket(device, TYPE_RFCOMM, -1, false, false, -1, uuid)));
 
         for (SocketFactory factory : factories) {
             BluetoothSocket socket = null;
@@ -375,7 +371,7 @@ final class AirPodsProbe {
                     log.line(factory.name + " returned null.");
                     continue;
                 }
-                boolean ok = connectWithTimeout(socket, CONNECT_TIMEOUT_MS);
+                boolean ok = connectWithTimeout(socket, UUID_CONNECT_TIMEOUT_MS);
                 if (ok) {
                     return new SocketAttempt(socket, factory.name);
                 }
@@ -385,7 +381,132 @@ final class AirPodsProbe {
                 closeQuietly(socket);
             }
         }
+
+        SocketAttempt dynamic = tryDeclaredCreateSocketMethods(device, uuid, TYPE_L2CAP);
+        if (dynamic.socket != null) return dynamic;
         return new SocketAttempt(null, null);
+    }
+
+    private void logBluetoothDeviceSocketMethods() {
+        log.line("BluetoothDevice socket-related declared methods on this ROM:");
+        int count = 0;
+        for (Method m : BluetoothDevice.class.getDeclaredMethods()) {
+            String n = m.getName();
+            String lower = n.toLowerCase(Locale.US);
+            if (lower.contains("socket") || lower.contains("l2cap") || lower.contains("rfcomm")) {
+                log.line("  " + methodSignature(m));
+                count++;
+            }
+        }
+        if (count == 0) {
+            log.line("  <none found>");
+        }
+    }
+
+    private SocketAttempt tryDeclaredCreateSocketMethods(BluetoothDevice device, UUID uuid, int socketType) {
+        log.line("Trying dynamic declared createSocket methods for UUID " + uuid + " with socketType=" + socketType + ".");
+        int[] portChoices = new int[] {-1, 0, 31, 4097};
+        boolean[] secureChoices = new boolean[] {true, false};
+
+        for (Method m : BluetoothDevice.class.getDeclaredMethods()) {
+            if (!"createSocket".equals(m.getName())) continue;
+            if (!BluetoothSocket.class.isAssignableFrom(m.getReturnType())) continue;
+            if (!methodHasUuidLikeParam(m)) {
+                log.line("Skipping createSocket without UUID/ParcelUuid parameter: " + methodSignature(m));
+                continue;
+            }
+
+            for (int port : portChoices) {
+                for (boolean secure : secureChoices) {
+                    BluetoothSocket socket = null;
+                    String strategy = "dynamic " + methodSignature(m) + " type=" + socketType + " port=" + port + " secure=" + secure;
+                    try {
+                        log.line("Trying " + strategy + ".");
+                        socket = invokeDynamicCreateSocket(device, m, socketType, port, secure, uuid);
+                        if (socket == null) {
+                            log.line("  returned null.");
+                            continue;
+                        }
+                        boolean ok = connectWithTimeout(socket, UUID_CONNECT_TIMEOUT_MS);
+                        if (ok) {
+                            return new SocketAttempt(socket, strategy);
+                        }
+                        closeQuietly(socket);
+                    } catch (Throwable t) {
+                        log.line("  failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
+                        closeQuietly(socket);
+                    }
+                }
+            }
+        }
+        log.line("No dynamic declared createSocket method connected for UUID " + uuid + ".");
+        return new SocketAttempt(null, null);
+    }
+
+    private BluetoothSocket invokeDynamicCreateSocket(BluetoothDevice device, Method m, int socketType, int port, boolean secure, UUID uuid) throws Exception {
+        m.setAccessible(true);
+        Class<?>[] types = m.getParameterTypes();
+        Object[] args = new Object[types.length];
+
+        int intCount = 0;
+        for (Class<?> t : types) if (t == int.class || t == Integer.TYPE) intCount++;
+
+        int intIndex = 0;
+        int boolIndex = 0;
+        for (int i = 0; i < types.length; i++) {
+            Class<?> t = types[i];
+            if (t == int.class || t == Integer.TYPE) {
+                if (intCount >= 3) {
+                    if (intIndex == 0) args[i] = socketType;      // type
+                    else if (intIndex == 1) args[i] = -1;         // fd
+                    else args[i] = port;                          // port/psm
+                } else if (intCount == 2) {
+                    if (intIndex == 0) args[i] = socketType;
+                    else args[i] = port;
+                } else {
+                    args[i] = port;
+                }
+                intIndex++;
+            } else if (t == boolean.class || t == Boolean.TYPE) {
+                args[i] = secure;
+                boolIndex++;
+            } else if (t.getName().equals("android.os.ParcelUuid")) {
+                args[i] = new ParcelUuid(uuid);
+            } else if (t.getName().equals("java.util.UUID")) {
+                args[i] = uuid;
+            } else {
+                throw new NoSuchMethodException("Unsupported parameter type in " + methodSignature(m) + ": " + t.getName());
+            }
+        }
+        Object result = m.invoke(device, args);
+        return (BluetoothSocket) result;
+    }
+
+    private boolean methodHasUuidLikeParam(Method m) {
+        for (Class<?> t : m.getParameterTypes()) {
+            String name = t.getName();
+            if (name.equals("java.util.UUID") || name.equals("android.os.ParcelUuid")) return true;
+        }
+        return false;
+    }
+
+    private String methodSignature(Method m) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(m.getReturnType().getSimpleName()).append(' ').append(m.getName()).append('(');
+        Class<?>[] types = m.getParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(types[i].getSimpleName());
+        }
+        sb.append(')');
+        return sb.toString();
+    }
+
+    private String rootMessage(Throwable t) {
+        Throwable c = t;
+        while (c.getCause() != null) c = c.getCause();
+        String msg = c.getMessage();
+        return c.getClass().getSimpleName() + (msg == null ? "" : ": " + msg);
     }
 
     private BluetoothSocket invokeCreateSocket(BluetoothDevice device, int type, int fd, boolean auth, boolean encrypt, int port, UUID uuid) throws Exception {
