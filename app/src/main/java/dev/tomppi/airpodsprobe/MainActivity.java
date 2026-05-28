@@ -4,10 +4,12 @@ import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -36,16 +38,62 @@ public final class MainActivity extends Activity {
     private CheckBox probeAacp;
     private CheckBox probeAtt;
     private CheckBox sendRaw;
+    private CheckBox stabilityTest;
     private EditText rawHex;
     private ProbeLog log;
+    private BroadcastReceiver bluetoothReceiver;
     private final List<BluetoothDevice> bondedDevices = new ArrayList<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         buildUi();
+        registerBluetoothEventReceiver();
         requestNeededPermissions();
         refreshDevices();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (bluetoothReceiver != null) {
+            try { unregisterReceiver(bluetoothReceiver); } catch (Exception ignored) {}
+        }
+    }
+
+    private void registerBluetoothEventReceiver() {
+        bluetoothReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (log == null || intent == null) return;
+                String action = intent.getAction();
+                BluetoothDevice d = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                String label = "<unknown>";
+                if (d != null) {
+                    try {
+                        label = safeName(d) + " / " + d.getAddress();
+                    } catch (SecurityException e) {
+                        label = "<bluetooth permission denied>";
+                    }
+                }
+                if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
+                    log.line("[BT broadcast] ACL_CONNECTED: " + label);
+                } else if (BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED.equals(action)) {
+                    log.line("[BT broadcast] ACL_DISCONNECT_REQUESTED: " + label);
+                } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
+                    log.line("[BT broadcast] ACL_DISCONNECTED: " + label);
+                }
+            }
+        };
+        IntentFilter f = new IntentFilter();
+        f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+        f.addAction(BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED);
+        f.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(bluetoothReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(bluetoothReceiver, f);
+        }
     }
 
     private void buildUi() {
@@ -92,6 +140,11 @@ public final class MainActivity extends Activity {
         probeAtt.setText("Probe ATT PSM 31 and read handles 0x18 / 0x1B / 0x2A");
         probeAtt.setChecked(true);
         root.addView(probeAtt, new LinearLayout.LayoutParams(-1, -2));
+
+        stabilityTest = new CheckBox(this);
+        stabilityTest.setText("Run stability/disconnect lab: AACP init + ATT hold + repeated safe reads");
+        stabilityTest.setChecked(true);
+        root.addView(stabilityTest, new LinearLayout.LayoutParams(-1, -2));
 
         sendRaw = new CheckBox(this);
         sendRaw.setText("Advanced: send raw hex to PSM 31 once");
@@ -190,7 +243,8 @@ public final class MainActivity extends Activity {
                 probeAacp.isChecked(),
                 probeAtt.isChecked(),
                 sendRaw.isChecked(),
-                rawHex.getText().toString()
+                rawHex.getText().toString(),
+                stabilityTest.isChecked()
         ), "airpods-probe-thread").start();
     }
 

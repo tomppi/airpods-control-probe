@@ -93,3 +93,16 @@ The app now logs `BluetoothDevice.getUuids()` and tries RFCOMM and hidden `creat
 ## v7 notes
 
 Adds runtime enumeration of BluetoothDevice socket methods and dynamic reflection attempts for ROM-specific `createSocket` signatures.
+
+
+## v8 stability/disconnect lab
+
+This version adds a read-only stability mode designed for debugging disconnects after the ATT channel becomes reachable. It:
+
+1. Opens AACP PSM 4097.
+2. Sends the LibrePods-style init sequence.
+3. Opens ATT PSM 31 with `createInsecureL2capSocket(31)`.
+4. Repeatedly reads handles `0x18`, `0x1B`, and `0x2A`.
+5. Closes ATT first, then AACP, and logs Bluetooth ACL disconnect broadcasts.
+
+The goal is to determine whether disconnects happen during ATT reads, when sockets are closed, or from Android Bluetooth profile/ACL events.

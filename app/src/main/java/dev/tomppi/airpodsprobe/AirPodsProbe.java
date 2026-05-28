@@ -34,7 +34,7 @@ final class AirPodsProbe {
         this.log = log;
     }
 
-    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex) {
+    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex, boolean doStability) {
         log.line("=== AirPods control probe started ===");
         log.line("Device: " + safeName(device) + " / " + device.getAddress());
         log.line("This app relies on the existing LibrePods Xposed module being active in com.android.bluetooth.");
@@ -63,6 +63,10 @@ final class AirPodsProbe {
             } catch (Exception e) {
                 log.line("Raw payload parse failed: " + e.getMessage());
             }
+        }
+
+        if (doStability) {
+            testDisconnectStability(device);
         }
 
         log.line("=== Probe finished ===");
@@ -115,6 +119,90 @@ final class AirPodsProbe {
             closeQuietly(attempt.socket);
             log.line("PSM " + psm + " socket closed.");
         }
+    }
+
+
+    private void testDisconnectStability(BluetoothDevice device) {
+        log.line("--- Stability/disconnect lab: AACP init + ATT hold + repeated safe reads ---");
+        log.line("This test is read-only. It keeps AACP PSM 4097 open, opens ATT PSM 31 using the method that worked on this ROM, then repeatedly reads known handles.");
+        log.line("Watch for Android ACL_DISCONNECTED broadcasts in the log while this test is running or during the 15-second post-close watch.");
+        BluetoothSocket aacpSocket = null;
+        BluetoothSocket attSocket = null;
+        try {
+            SocketAttempt aacp = tryAllStrategies(device, 4097);
+            aacpSocket = aacp.socket;
+            if (aacpSocket == null) {
+                log.line("Stability test aborted: could not open AACP PSM 4097.");
+                return;
+            }
+            log.line("Stability: AACP PSM 4097 connected using " + aacp.strategy + ". Sending init sequence.");
+            runAacpInitSequence(aacpSocket);
+            log.line("Stability: AACP init sent. Waiting 1000 ms before ATT open.");
+            sleep(1000);
+
+            SocketAttempt att = tryAttPostInitPreferred(device);
+            attSocket = att.socket;
+            if (attSocket == null) {
+                log.line("Stability test aborted: ATT PSM 31 did not connect even after AACP init.");
+                return;
+            }
+            log.line("Stability: ATT PSM 31 connected using " + att.strategy + ". Starting repeated safe reads.");
+
+            for (int cycle = 1; cycle <= 20; cycle++) {
+                log.line(String.format(Locale.US, "Stability cycle %02d/20: safe read set begin", cycle));
+                attRead(attSocket, 0x0018, "TRANSPARENCY_CONFIG");
+                sleep(200);
+                attRead(attSocket, 0x001B, "LOUD_SOUND_REDUCTION");
+                sleep(200);
+                attRead(attSocket, 0x002A, "HEARING_AID_CONFIG");
+                log.line(String.format(Locale.US, "Stability cycle %02d/20: safe read set end", cycle));
+                sleep(1700);
+            }
+
+            log.line("Stability reads completed. Closing ATT first, then AACP after 2 seconds.");
+            closeQuietly(attSocket);
+            attSocket = null;
+            log.line("Stability: ATT socket closed first. Waiting 2000 ms before closing AACP.");
+            sleep(2000);
+            closeQuietly(aacpSocket);
+            aacpSocket = null;
+            log.line("Stability: AACP socket closed. Watching for ACL/profile disconnect broadcasts for 15 seconds.");
+            sleep(15000);
+            log.line("Stability/disconnect lab finished.");
+        } catch (Throwable t) {
+            log.line("Stability test crashed/failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
+        } finally {
+            closeQuietly(attSocket);
+            closeQuietly(aacpSocket);
+        }
+    }
+
+    private SocketAttempt tryAttPostInitPreferred(BluetoothDevice device) {
+        List<SocketFactory> factories = new ArrayList<>();
+        factories.add(new SocketFactory("preferred hidden createInsecureL2capSocket(31) after AACP init", () -> invokeSocket(device, "createInsecureL2capSocket", 31)));
+        factories.add(new SocketFactory("fallback hidden createL2capSocket(31) after AACP init", () -> invokeSocket(device, "createL2capSocket", 31)));
+        if (Build.VERSION.SDK_INT >= 29) {
+            factories.add(new SocketFactory("fallback public createInsecureL2capChannel(31) after AACP init", () -> device.createInsecureL2capChannel(31)));
+            factories.add(new SocketFactory("fallback public createL2capChannel(31) after AACP init", () -> device.createL2capChannel(31)));
+        }
+        for (SocketFactory factory : factories) {
+            BluetoothSocket socket = null;
+            try {
+                log.line("Stability: trying " + factory.name + ".");
+                socket = factory.create();
+                if (socket == null) {
+                    log.line("Stability: " + factory.name + " returned null.");
+                    continue;
+                }
+                boolean ok = connectWithTimeout(socket, CONNECT_TIMEOUT_MS);
+                if (ok) return new SocketAttempt(socket, factory.name);
+                closeQuietly(socket);
+            } catch (Throwable t) {
+                log.line("Stability: " + factory.name + " failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                closeQuietly(socket);
+            }
+        }
+        return new SocketAttempt(null, null);
     }
 
     private void testAttWhileAacpHeldOpen(BluetoothDevice device) {
