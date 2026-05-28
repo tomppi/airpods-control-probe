@@ -266,101 +266,166 @@ final class AirPodsProbe {
 
 
     private void testHearingAidWriteMethodExperiment(BluetoothDevice device) {
-        log.line("--- Hearing Aid 0x2A write-method experiment ---");
-        log.line("WARNING: this test intentionally writes temporary changed 0x2A blobs, then tries to restore the original value.");
-        log.line("It is meant to identify whether hearing-aid save needs Write Request, Write Command, Prepare/Execute Write, or a commit step.");
+        log.line("--- Hearing Aid 0x2A isolated write experiment v12 ---");
+        log.line("This version opens a fresh AACP+ATT session for each mutation so one bad 0x2A write cannot poison all later tests.");
+        log.line("It focuses on whether header-preserved hearing-aid data mutations can ever persist by readback.");
+
+        ControlSession baselineSession = null;
+        byte[] baseline;
+        try {
+            baselineSession = openControlSession(device, "Baseline");
+            if (baselineSession.attSocket == null) {
+                log.line("v12 aborted: could not open ATT for baseline read.");
+                return;
+            }
+            baseline = attReadValue(baselineSession.attSocket, 0x002A, "v12 baseline HEARING_AID_CONFIG");
+            if (baseline == null || baseline.length < 12) {
+                log.line("v12 aborted: baseline 0x2A read failed or was too short.");
+                return;
+            }
+            log.line("v12 baseline 0x2A value: " + Hex.bytes(baseline, baseline.length));
+        } finally {
+            closeSession(baselineSession);
+        }
+
+        byte[] headerChanged = baseline.clone();
+        if (headerChanged.length >= 4) headerChanged[2] = (byte) 0x64;
+
+        byte[] headerPreservedFloat4 = baseline.clone();
+        headerPreservedFloat4[4] = (byte) 0xCD;
+        headerPreservedFloat4[5] = (byte) 0xCC;
+        headerPreservedFloat4[6] = 0x4C;
+        headerPreservedFloat4[7] = 0x3D; // float 0.05 LE
+
+        byte[] headerPreservedFloat8 = baseline.clone();
+        headerPreservedFloat8[8] = (byte) 0xCD;
+        headerPreservedFloat8[9] = (byte) 0xCC;
+        headerPreservedFloat8[10] = 0x4C;
+        headerPreservedFloat8[11] = 0x3D; // float 0.05 LE
+
+        byte[] singleByte4 = baseline.clone();
+        singleByte4[4] = 0x01;
+
+        byte[] singleByte8 = baseline.clone();
+        singleByte8[8] = 0x01;
+
+        byte[] tailByte = baseline.clone();
+        tailByte[tailByte.length - 2] = (byte) (tailByte[tailByte.length - 2] ^ 0x01);
+
+        runIsolatedWriteMutation(device, "A-control header byte[2] 0x60->0x64", baseline, headerChanged, WriteMode.REQUEST);
+        runIsolatedWriteMutation(device, "E-fix theory header preserved float at bytes[4..7]", baseline, headerPreservedFloat4, WriteMode.REQUEST);
+        runIsolatedWriteMutation(device, "H header preserved float at bytes[8..11]", baseline, headerPreservedFloat8, WriteMode.REQUEST);
+        runIsolatedWriteMutation(device, "I header preserved single byte[4]=0x01", baseline, singleByte4, WriteMode.REQUEST);
+        runIsolatedWriteMutation(device, "J header preserved single byte[8]=0x01", baseline, singleByte8, WriteMode.REQUEST);
+        runIsolatedWriteMutation(device, "K tail byte toggle near end", baseline, tailByte, WriteMode.REQUEST);
+
+        ControlSession finalSession = null;
+        try {
+            finalSession = openControlSession(device, "Final check");
+            if (finalSession.attSocket != null) {
+                byte[] finalValue = attReadValue(finalSession.attSocket, 0x002A, "v12 final HEARING_AID_CONFIG");
+                log.line("v12 final value equals baseline: " + Arrays.equals(baseline, finalValue));
+            }
+        } finally {
+            closeSession(finalSession);
+        }
+
+        log.line("v12 isolated write experiment complete.");
+    }
+
+    private void runIsolatedWriteMutation(BluetoothDevice device, String label, byte[] baseline, byte[] mutated, WriteMode mode) {
+        log.line("--- v12 isolated test: " + label + " ---");
+        log.line("Target mutated blob: " + Hex.bytes(mutated, mutated.length));
+        ControlSession session = null;
+        try {
+            session = openControlSession(device, label);
+            if (session.attSocket == null) {
+                log.line(label + ": skipped because ATT did not connect.");
+                return;
+            }
+
+            byte[] before = attReadValue(session.attSocket, 0x002A, label + " before-write read");
+            log.line(label + ": before-write equals baseline: " + Arrays.equals(baseline, before));
+
+            if (mode == WriteMode.REQUEST) {
+                byte[] wr = attWriteRequest(session.attSocket, 0x002A, mutated, label);
+                log.line(label + ": write response is " + (wr == null ? "null" : Hex.bytes(wr, wr.length)));
+            } else if (mode == WriteMode.COMMAND) {
+                attWriteCommand(session.attSocket, 0x002A, mutated, label);
+            } else {
+                attPrepareExecuteWrite(session.attSocket, 0x002A, mutated, label);
+            }
+
+            int[] waits = new int[] {0, 250, 1000};
+            boolean anyMutated = false;
+            boolean socketDied = false;
+            for (int wait : waits) {
+                if (wait > 0) sleep(wait);
+                byte[] rb = attReadValue(session.attSocket, 0x002A, label + " readback after " + wait + "ms");
+                if (rb == null) {
+                    log.line(label + ": readback after " + wait + "ms failed; ATT socket likely closed/rejected this write.");
+                    socketDied = true;
+                    break;
+                }
+                boolean equalsMutated = Arrays.equals(mutated, rb);
+                boolean equalsBaseline = Arrays.equals(baseline, rb);
+                log.line(label + ": readback after " + wait + "ms equals mutated target: " + equalsMutated + ", equals baseline: " + equalsBaseline);
+                anyMutated |= equalsMutated;
+            }
+
+            if (anyMutated) {
+                log.line(label + ": MUTATION PERSISTED; restoring baseline now.");
+                attWriteRequest(session.attSocket, 0x002A, baseline, "restore after persisted " + label);
+                sleep(500);
+                byte[] restored = attReadValue(session.attSocket, 0x002A, label + " restore readback");
+                log.line(label + ": restore readback equals baseline: " + Arrays.equals(baseline, restored));
+            } else if (socketDied) {
+                log.line(label + ": mutation did not verify and the ATT socket died. This suggests AirPods rejected/closed on this payload.");
+            } else {
+                log.line(label + ": mutation was acknowledged or sent, but readback stayed baseline. This suggests the payload is invalid or missing a commit/auth step.");
+            }
+        } catch (Throwable t) {
+            log.line(label + ": isolated test failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
+        } finally {
+            closeSession(session);
+            sleep(1200);
+        }
+    }
+
+    private ControlSession openControlSession(BluetoothDevice device, String label) {
         BluetoothSocket aacpSocket = null;
         BluetoothSocket attSocket = null;
         try {
             SocketAttempt aacp = tryAllStrategies(device, 4097);
             aacpSocket = aacp.socket;
             if (aacpSocket == null) {
-                log.line("Write experiment aborted: could not open AACP PSM 4097.");
-                return;
+                log.line(label + ": could not open AACP PSM 4097.");
+                return new ControlSession(null, null);
             }
-            log.line("Write experiment: AACP PSM 4097 connected using " + aacp.strategy + ". Sending init sequence.");
+            log.line(label + ": AACP PSM 4097 connected using " + aacp.strategy + ". Sending init sequence.");
             runAacpInitSequence(aacpSocket);
-            log.line("Write experiment: AACP init sent. Waiting 1000 ms before ATT open.");
             sleep(1000);
-
-            SocketAttempt att = tryAttPostInitPreferredWithRetries(device, "Write experiment");
+            SocketAttempt att = tryAttPostInitPreferredWithRetries(device, label);
             attSocket = att.socket;
             if (attSocket == null) {
-                log.line("Write experiment aborted: ATT PSM 31 did not connect after AACP init.");
-                return;
+                log.line(label + ": could not open ATT PSM 31 after AACP init.");
+                closeQuietly(aacpSocket);
+                return new ControlSession(null, null);
             }
-            log.line("Write experiment: ATT PSM 31 connected using " + att.strategy + ".");
-
-            byte[] original = attReadValue(attSocket, 0x002A, "HEARING_AID_CONFIG original");
-            if (original == null || original.length < 8) {
-                log.line("Write experiment aborted: could not read a usable original 0x2A blob.");
-                return;
-            }
-            log.line("Write experiment: original 0x2A value: " + Hex.bytes(original, original.length));
-
-            byte[] mutantHeader = original.clone();
-            if (mutantHeader.length >= 4 && (mutantHeader[0] & 0xFF) == 0x02 && (mutantHeader[2] & 0xFF) == 0x60) {
-                mutantHeader[2] = 0x64;
-                log.line("Write experiment: mutant A changes byte[2] 0x60 -> 0x64, matching the LibrePods balance-style update observed in logs.");
-            } else {
-                mutantHeader[mutantHeader.length - 1] = (byte) (mutantHeader[mutantHeader.length - 1] ^ 0x01);
-                log.line("Write experiment: original did not match 02 00 60 00 header; mutant A toggles last byte as fallback.");
-            }
-
-            byte[] mutantEq = mutantHeader.clone();
-            if (mutantEq.length >= 8) {
-                mutantEq[4] = (byte) 0xCD;
-                mutantEq[5] = (byte) 0xCC;
-                mutantEq[6] = 0x4C;
-                mutantEq[7] = 0x3D; // float 0.05, little-endian
-                log.line("Write experiment: mutant B additionally sets bytes[4..7] to CD CC 4C 3D (float 0.05), matching LibrePods EQ-style update.");
-            }
-
-            byte[] mutantEqPreserveHeader = original.clone();
-            if (mutantEqPreserveHeader.length >= 8) {
-                mutantEqPreserveHeader[4] = (byte) 0xCD;
-                mutantEqPreserveHeader[5] = (byte) 0xCC;
-                mutantEqPreserveHeader[6] = 0x4C;
-                mutantEqPreserveHeader[7] = 0x3D; // float 0.05, little-endian
-                log.line("Write experiment: mutant E keeps header bytes[0..3] unchanged and only sets bytes[4..7] to CD CC 4C 3D (float 0.05).");
-            }
-
-            byte[] mutantEqPreserveHeaderOffset8 = original.clone();
-            if (mutantEqPreserveHeaderOffset8.length >= 12) {
-                mutantEqPreserveHeaderOffset8[8] = (byte) 0xCD;
-                mutantEqPreserveHeaderOffset8[9] = (byte) 0xCC;
-                mutantEqPreserveHeaderOffset8[10] = 0x4C;
-                mutantEqPreserveHeaderOffset8[11] = 0x3D; // float 0.05, little-endian
-                log.line("Write experiment: mutant H keeps header bytes[0..3] unchanged and only sets bytes[8..11] to CD CC 4C 3D (next float slot).");
-            }
-
-            byte[] mutantSingleDataByte = original.clone();
-            if (mutantSingleDataByte.length >= 8) {
-                mutantSingleDataByte[4] = 0x01;
-                log.line("Write experiment: mutant I keeps header bytes[0..3] unchanged and only changes byte[4] to 0x01 as a minimal data-byte write.");
-            }
-
-            runWriteMutationTest(attSocket, "A: Write Request 0x12, header/balance-style mutant", original, mutantHeader, WriteMode.REQUEST);
-            runWriteMutationTest(attSocket, "B: Write Command 0x52, header/balance-style mutant", original, mutantHeader, WriteMode.COMMAND);
-            runWriteMutationTest(attSocket, "C: Prepare/Execute Write, header/balance-style mutant", original, mutantHeader, WriteMode.PREPARE_EXECUTE);
-            runWriteMutationTest(attSocket, "D: Write Request 0x12, EQ-style mutant with header changed", original, mutantEq, WriteMode.REQUEST);
-            runWriteMutationTest(attSocket, "E: Write Request 0x12, EQ-style mutant with header preserved", original, mutantEqPreserveHeader, WriteMode.REQUEST);
-            runWriteMutationTest(attSocket, "F: Write Command 0x52, EQ-style mutant with header preserved", original, mutantEqPreserveHeader, WriteMode.COMMAND);
-            runWriteMutationTest(attSocket, "G: Prepare/Execute Write, EQ-style mutant with header preserved", original, mutantEqPreserveHeader, WriteMode.PREPARE_EXECUTE);
-            runWriteMutationTest(attSocket, "H: Write Request 0x12, next-float-slot mutant with header preserved", original, mutantEqPreserveHeaderOffset8, WriteMode.REQUEST);
-            runWriteMutationTest(attSocket, "I: Write Request 0x12, minimal single data-byte mutant with header preserved", original, mutantSingleDataByte, WriteMode.REQUEST);
-
-            log.line("Write experiment complete. Final restore check.");
-            restoreOriginal(attSocket, original, "final restore");
-            byte[] finalValue = attReadValue(attSocket, 0x002A, "HEARING_AID_CONFIG final");
-            log.line("Write experiment final value equals original: " + Arrays.equals(original, finalValue));
+            log.line(label + ": ATT PSM 31 connected using " + att.strategy + ".");
+            return new ControlSession(aacpSocket, attSocket);
         } catch (Throwable t) {
-            log.line("Write experiment failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
-        } finally {
+            log.line(label + ": openControlSession failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
             closeQuietly(attSocket);
             closeQuietly(aacpSocket);
-            log.line("Write experiment sockets closed.");
+            return new ControlSession(null, null);
         }
+    }
+
+    private void closeSession(ControlSession session) {
+        if (session == null) return;
+        closeQuietly(session.attSocket);
+        closeQuietly(session.aacpSocket);
     }
 
     private enum WriteMode { REQUEST, COMMAND, PREPARE_EXECUTE }
@@ -1032,6 +1097,16 @@ final class AirPodsProbe {
             this.creator = creator;
         }
         BluetoothSocket create() throws Exception { return creator.create(); }
+    }
+
+
+    private static final class ControlSession {
+        final BluetoothSocket aacpSocket;
+        final BluetoothSocket attSocket;
+        ControlSession(BluetoothSocket aacpSocket, BluetoothSocket attSocket) {
+            this.aacpSocket = aacpSocket;
+            this.attSocket = attSocket;
+        }
     }
 
     private static final class SocketAttempt {
