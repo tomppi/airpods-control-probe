@@ -35,7 +35,7 @@ final class AirPodsProbe {
         this.log = log;
     }
 
-    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex, boolean doStability, boolean doHearingWriteVerify) {
+    void probe(BluetoothDevice device, boolean doAacp, boolean doAtt, boolean tryRaw, String rawHex, boolean doStability, boolean doHearingWriteVerify, boolean doHearingMethodExperiment) {
         log.line("=== AirPods control probe started ===");
         log.line("Device: " + safeName(device) + " / " + device.getAddress());
         log.line("This app relies on the existing LibrePods Xposed module being active in com.android.bluetooth.");
@@ -72,6 +72,10 @@ final class AirPodsProbe {
 
         if (doHearingWriteVerify) {
             testHearingAidNoOpWriteVerifier(device);
+        }
+
+        if (doHearingMethodExperiment) {
+            testHearingAidWriteMethodExperiment(device);
         }
 
         log.line("=== Probe finished ===");
@@ -145,7 +149,7 @@ final class AirPodsProbe {
             log.line("Stability: AACP init sent. Waiting 1000 ms before ATT open.");
             sleep(1000);
 
-            SocketAttempt att = tryAttPostInitPreferred(device);
+            SocketAttempt att = tryAttPostInitPreferredWithRetries(device, "Hearing verifier");
             attSocket = att.socket;
             if (attSocket == null) {
                 log.line("Stability test aborted: ATT PSM 31 did not connect even after AACP init.");
@@ -183,6 +187,17 @@ final class AirPodsProbe {
     }
 
 
+
+    private SocketAttempt tryAttPostInitPreferredWithRetries(BluetoothDevice device, String label) {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            log.line(label + ": ATT open attempt " + attempt + "/3.");
+            SocketAttempt att = tryAttPostInitPreferred(device);
+            if (att.socket != null) return att;
+            sleep(900);
+        }
+        return new SocketAttempt(null, null);
+    }
+
     private void testHearingAidNoOpWriteVerifier(BluetoothDevice device) {
         log.line("--- Hearing Aid 0x2A no-op write verifier ---");
         log.line("This test is intended to be safe: it reads handle 0x002A, writes the exact same value back, then reads it again.");
@@ -201,7 +216,7 @@ final class AirPodsProbe {
             log.line("Hearing verifier: AACP init sent. Waiting 1000 ms before ATT open.");
             sleep(1000);
 
-            SocketAttempt att = tryAttPostInitPreferred(device);
+            SocketAttempt att = tryAttPostInitPreferredWithRetries(device, "Hearing verifier");
             attSocket = att.socket;
             if (attSocket == null) {
                 log.line("Hearing verifier aborted: ATT PSM 31 did not connect after AACP init.");
@@ -246,6 +261,186 @@ final class AirPodsProbe {
             closeQuietly(attSocket);
             closeQuietly(aacpSocket);
             log.line("Hearing verifier sockets closed.");
+        }
+    }
+
+
+    private void testHearingAidWriteMethodExperiment(BluetoothDevice device) {
+        log.line("--- Hearing Aid 0x2A write-method experiment ---");
+        log.line("WARNING: this test intentionally writes temporary changed 0x2A blobs, then tries to restore the original value.");
+        log.line("It is meant to identify whether hearing-aid save needs Write Request, Write Command, Prepare/Execute Write, or a commit step.");
+        BluetoothSocket aacpSocket = null;
+        BluetoothSocket attSocket = null;
+        try {
+            SocketAttempt aacp = tryAllStrategies(device, 4097);
+            aacpSocket = aacp.socket;
+            if (aacpSocket == null) {
+                log.line("Write experiment aborted: could not open AACP PSM 4097.");
+                return;
+            }
+            log.line("Write experiment: AACP PSM 4097 connected using " + aacp.strategy + ". Sending init sequence.");
+            runAacpInitSequence(aacpSocket);
+            log.line("Write experiment: AACP init sent. Waiting 1000 ms before ATT open.");
+            sleep(1000);
+
+            SocketAttempt att = tryAttPostInitPreferredWithRetries(device, "Write experiment");
+            attSocket = att.socket;
+            if (attSocket == null) {
+                log.line("Write experiment aborted: ATT PSM 31 did not connect after AACP init.");
+                return;
+            }
+            log.line("Write experiment: ATT PSM 31 connected using " + att.strategy + ".");
+
+            byte[] original = attReadValue(attSocket, 0x002A, "HEARING_AID_CONFIG original");
+            if (original == null || original.length < 8) {
+                log.line("Write experiment aborted: could not read a usable original 0x2A blob.");
+                return;
+            }
+            log.line("Write experiment: original 0x2A value: " + Hex.bytes(original, original.length));
+
+            byte[] mutantHeader = original.clone();
+            if (mutantHeader.length >= 4 && (mutantHeader[0] & 0xFF) == 0x02 && (mutantHeader[2] & 0xFF) == 0x60) {
+                mutantHeader[2] = 0x64;
+                log.line("Write experiment: mutant A changes byte[2] 0x60 -> 0x64, matching the LibrePods balance-style update observed in logs.");
+            } else {
+                mutantHeader[mutantHeader.length - 1] = (byte) (mutantHeader[mutantHeader.length - 1] ^ 0x01);
+                log.line("Write experiment: original did not match 02 00 60 00 header; mutant A toggles last byte as fallback.");
+            }
+
+            byte[] mutantEq = mutantHeader.clone();
+            if (mutantEq.length >= 8) {
+                mutantEq[4] = (byte) 0xCD;
+                mutantEq[5] = (byte) 0xCC;
+                mutantEq[6] = 0x4C;
+                mutantEq[7] = 0x3D; // float 0.05, little-endian
+                log.line("Write experiment: mutant B additionally sets bytes[4..7] to CD CC 4C 3D (float 0.05), matching LibrePods EQ-style update.");
+            }
+
+            runWriteMutationTest(attSocket, "A: Write Request 0x12, header/balance-style mutant", original, mutantHeader, WriteMode.REQUEST);
+            runWriteMutationTest(attSocket, "B: Write Command 0x52, header/balance-style mutant", original, mutantHeader, WriteMode.COMMAND);
+            runWriteMutationTest(attSocket, "C: Prepare/Execute Write, header/balance-style mutant", original, mutantHeader, WriteMode.PREPARE_EXECUTE);
+            runWriteMutationTest(attSocket, "D: Write Request 0x12, EQ-style mutant", original, mutantEq, WriteMode.REQUEST);
+
+            log.line("Write experiment complete. Final restore check.");
+            restoreOriginal(attSocket, original, "final restore");
+            byte[] finalValue = attReadValue(attSocket, 0x002A, "HEARING_AID_CONFIG final");
+            log.line("Write experiment final value equals original: " + Arrays.equals(original, finalValue));
+        } catch (Throwable t) {
+            log.line("Write experiment failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
+        } finally {
+            closeQuietly(attSocket);
+            closeQuietly(aacpSocket);
+            log.line("Write experiment sockets closed.");
+        }
+    }
+
+    private enum WriteMode { REQUEST, COMMAND, PREPARE_EXECUTE }
+
+    private void runWriteMutationTest(BluetoothSocket socket, String label, byte[] original, byte[] mutated, WriteMode mode) {
+        log.line("--- " + label + " ---");
+        log.line("Mutated target blob: " + Hex.bytes(mutated, mutated.length));
+        try {
+            if (mode == WriteMode.REQUEST) {
+                attWriteRequest(socket, 0x002A, mutated, label);
+            } else if (mode == WriteMode.COMMAND) {
+                attWriteCommand(socket, 0x002A, mutated, label);
+            } else {
+                attPrepareExecuteWrite(socket, 0x002A, mutated, label);
+            }
+
+            readbackSeries(socket, label, mutated);
+        } finally {
+            restoreOriginal(socket, original, "restore after " + label);
+            sleep(500);
+            byte[] restored = attReadValue(socket, 0x002A, "readback after restore for " + label);
+            log.line(label + ": restore readback equals original: " + Arrays.equals(original, restored));
+        }
+    }
+
+    private void readbackSeries(BluetoothSocket socket, String label, byte[] expected) {
+        int[] waits = new int[] {0, 1000, 3000};
+        for (int wait : waits) {
+            if (wait > 0) sleep(wait);
+            byte[] rb = attReadValue(socket, 0x002A, label + " readback after " + wait + "ms");
+            if (rb == null) {
+                log.line(label + ": readback after " + wait + "ms failed.");
+            } else {
+                log.line(label + ": readback after " + wait + "ms equals mutated target: " + Arrays.equals(expected, rb));
+            }
+        }
+    }
+
+    private void restoreOriginal(BluetoothSocket socket, byte[] original, String label) {
+        log.line("Restoring original 0x2A using Write Request 0x12 (" + label + ").");
+        attWriteRequest(socket, 0x002A, original, label);
+    }
+
+    private void attWriteCommand(BluetoothSocket socket, int handle, byte[] value, String name) {
+        byte[] request = new byte[3 + value.length];
+        request[0] = 0x52;
+        request[1] = (byte) (handle & 0xFF);
+        request[2] = (byte) ((handle >> 8) & 0xFF);
+        System.arraycopy(value, 0, request, 3, value.length);
+        log.line(String.format(Locale.US, "ATT write command %s handle 0x%04X request: %s", name, handle, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            byte[] response = readWithTimeout(socket, 600);
+            if (response == null) {
+                log.line("ATT write command: no response expected/received.");
+            } else {
+                log.line("ATT write command unexpected response: " + Hex.bytes(response, response.length));
+            }
+        } catch (Exception e) {
+            log.line(String.format(Locale.US, "ATT write command 0x%04X failed: %s: %s", handle, e.getClass().getSimpleName(), e.getMessage()));
+        }
+    }
+
+    private void attPrepareExecuteWrite(BluetoothSocket socket, int handle, byte[] value, String name) {
+        log.line("ATT prepare/execute write " + name + " handle " + String.format(Locale.US, "0x%04X", handle) + ", total value bytes=" + value.length);
+        int offset = 0;
+        int chunkSize = 18;
+        while (offset < value.length) {
+            int len = Math.min(chunkSize, value.length - offset);
+            byte[] p = new byte[5 + len];
+            p[0] = 0x16;
+            p[1] = (byte) (handle & 0xFF);
+            p[2] = (byte) ((handle >> 8) & 0xFF);
+            p[3] = (byte) (offset & 0xFF);
+            p[4] = (byte) ((offset >> 8) & 0xFF);
+            System.arraycopy(value, offset, p, 5, len);
+            log.line("Prepare write offset " + offset + ": " + Hex.bytes(p, p.length));
+            try {
+                writeRaw(socket, p);
+                byte[] r = readWithTimeout(socket, READ_TIMEOUT_MS);
+                if (r == null) {
+                    log.line("Prepare write offset " + offset + ": no response; aborting prepare/execute test.");
+                    return;
+                }
+                log.line("Prepare write offset " + offset + " response: " + Hex.bytes(r, r.length));
+                if (r.length == 0 || (r[0] & 0xFF) != 0x17) {
+                    log.line("Prepare write offset " + offset + " did not return 0x17; aborting prepare/execute test.");
+                    return;
+                }
+            } catch (Exception e) {
+                log.line("Prepare write offset " + offset + " failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                return;
+            }
+            offset += len;
+            sleep(80);
+        }
+
+        byte[] exec = new byte[] {0x18, 0x01};
+        log.line("Execute write request: " + Hex.bytes(exec, exec.length));
+        try {
+            writeRaw(socket, exec);
+            byte[] r = readWithTimeout(socket, READ_TIMEOUT_MS);
+            if (r == null) {
+                log.line("Execute write: no response.");
+            } else {
+                log.line("Execute write response: " + Hex.bytes(r, r.length));
+            }
+        } catch (Exception e) {
+            log.line("Execute write failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 
