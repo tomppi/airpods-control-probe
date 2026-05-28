@@ -1,4 +1,4 @@
-package com.airpodsprobe.v20;
+package com.airpodsprobe.v29matrix;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
@@ -58,13 +58,13 @@ public class MainActivity extends Activity {
         root.setPadding(dp(16), dp(16), dp(16), dp(16));
 
         TextView title = new TextView(this);
-        title.setText("AirPods AACP v20 Probe");
+        title.setText("AirPods AACP v29 Matrix Probe");
         title.setTextSize(20);
         title.setGravity(Gravity.START);
         root.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
         TextView desc = new TextView(this);
-        desc.setText("Trigger-attribution matrix for AACP 0x0053/0x0055: varies AACP 0x0F masks, ATT-open timing, ATT reads, and CCCDs 0x0022/0x002B. Capture-only; no 0x0054 setter test.");
+        desc.setText("0x0054 validation matrix: captures current 0x0053, then uses delayed 0x0052 as an acceptance oracle for exact original, single-float Q8 mutations, all-32 uniform Q8 mutation, and exact-original restores. No ATT 0x002A writes.");
         desc.setPadding(0, dp(8), 0, dp(8));
         root.addView(desc, new LinearLayout.LayoutParams(-1, -2));
 
@@ -78,7 +78,7 @@ public class MainActivity extends Activity {
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         buttons.setPadding(0, dp(8), 0, dp(8));
         startButton = new Button(this);
-        startButton.setText("Run v20 probe");
+        startButton.setText("Run v29 matrix");
         startButton.setOnClickListener(v -> startProbe());
         buttons.addView(startButton, new LinearLayout.LayoutParams(0, -2, 1));
 
@@ -163,10 +163,10 @@ public class MainActivity extends Activity {
         logBuffer.setLength(0);
         logView.setText("");
         startButton.setEnabled(false);
-        appendLog("Starting v20 probe for " + mac + "...");
+        appendLog("Starting v29 matrix probe for " + mac + "...");
         executor.execute(() -> {
             try {
-                new AacpV20Probe(device, this::appendLog).run();
+                new AacpV29MatrixProbe(device, this::appendLog).run();
             } catch (Throwable t) {
                 appendLog("Probe crashed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             } finally {
@@ -178,7 +178,7 @@ public class MainActivity extends Activity {
     private void copyLog() {
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         if (cm != null) {
-            cm.setPrimaryClip(ClipData.newPlainText("AACP v20 probe log", logBuffer.toString()));
+            cm.setPrimaryClip(ClipData.newPlainText("AACP v29 matrix probe log", logBuffer.toString()));
             Toast.makeText(this, "Log copied", Toast.LENGTH_SHORT).show();
         }
     }

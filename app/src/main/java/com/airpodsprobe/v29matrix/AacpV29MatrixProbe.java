@@ -1,4 +1,4 @@
-package com.airpodsprobe.v23;
+package com.airpodsprobe.v29matrix;
 
 import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothDevice;
@@ -13,7 +13,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
-final class AacpV23Probe {
+final class AacpV29MatrixProbe {
     private static final int AACP_PSM = 4097;
     private static final int ATT_PSM = 31;
 
@@ -21,6 +21,9 @@ final class AacpV23Probe {
     private static final int HANDLE_SIBLING_24 = 0x0024;
     private static final int HANDLE_HEARING_CONFIG = 0x002A;
     private static final int HANDLE_CCCD_21 = 0x0022;
+
+    private static final float Q8_STEP = 1.0f / 256.0f;
+    private static final long MATRIX_DRAIN_MS = 18000;
 
     private static final byte[] AACP_HANDSHAKE = ByteUtil.bytes(
             0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00,
@@ -30,53 +33,52 @@ final class AacpV23Probe {
     private final BluetoothDevice device;
     private final LogSink log;
 
-    AacpV23Probe(BluetoothDevice device, LogSink log) {
+    AacpV29MatrixProbe(BluetoothDevice device, LogSink log) {
         this.device = device;
         this.log = log;
     }
 
     void run() {
-        log("=== AirPods AACP v23 probe started ===");
+        log("=== AirPods AACP v29 0x0054 validation-matrix probe started ===");
         log("Device: " + safeName(device) + " / " + device.getAddress());
         log("This app relies on the existing LibrePods Xposed module being active in com.android.bluetooth.");
         log("It does not install or replace the Xposed module.");
-        log("--- v23 body-only 0x0054 no-op shape test ---");
-        log("v22 captured the clean current-session 0x0053 vector and sent a full-payload 0x0054 echo, but there was no direct 0x0055/0x0053/0x0052 response and ATT 0x002A did not change.");
-        log("v23 keeps the same winning v20/v22 capture path, but tests the next wire-shape hypothesis: 0x0054 may want the 0x0053 body without the leading 2-byte reported length word.");
-        log("v23 still uses only current-session data. It strips the first 2 bytes only when the 0x0053 declared/body length equals payloadLen-2.");
-        log("v23 sends exactly one setter-like AACP frame: 04 00 04 00 54 00 <captured 0x0053 payload without the first two length bytes>.");
-        log("v23 does not send AACP 0x0052, 0x0053, or 0x0055 candidates.");
+        log("--- v29 pure AACP 0x0054 acceptance-oracle matrix ---");
+        log("v28 proved exact-original 0x0053-as-0x0054 produces delayed AACP 0x0052, while baseline and refresh-only do not.");
+        log("v29 therefore uses 0x0052 as an acceptance oracle for a small matrix of full-payload 0x0054 shapes.");
+        log("No ATT 0x002A writes are performed. No AACP 0x0052, 0x0053, or 0x0055 candidates are sent. 0x0052/0x0053/0x0055 are only observed as responses.");
+        log("Matrix: positive original, float[0]+Q8, restore, float[15]+Q8, restore, float[31]+Q8, restore, all32+Q8 uniform, restore.");
 
-        boolean sent = false;
+        boolean completed = false;
         final int attempts = 2;
         for (int i = 1; i <= attempts; i++) {
-            sent = runCaptureAndEchoAttempt(i, attempts);
-            if (sent) break;
+            completed = runMatrixAttempt(i, attempts);
+            if (completed) break;
             if (i < attempts) {
-                log("v23: attempt " + i + " did not capture a current-session 0x0053. Sleeping briefly, then retrying the same safe path once.");
+                log("v29 matrix: attempt " + i + " did not reach the guarded matrix. Sleeping briefly, then retrying once.");
                 sleep(1300);
             }
         }
-        if (!sent) {
-            log("v23 final result: no current-session AACP 0x0053 was captured after the fuller v20-style replay. No 0x0054 was sent.");
+        if (!completed) {
+            log("v29 final result: no guarded current-session 0x0053 payload was available, or the payload failed mutation guards, so the 0x0054 matrix was not sent.");
         }
         log("=== Probe finished ===");
     }
 
-    private boolean runCaptureAndEchoAttempt(int attempt, int totalAttempts) {
+    private boolean runMatrixAttempt(int attempt, int totalAttempts) {
         BluetoothSocket aacp = null;
         BluetoothSocket att = null;
-        AacpStreamSummary preSetter = new AacpStreamSummary();
+        AacpStreamSummary preCccd = new AacpStreamSummary();
         AacpStreamSummary afterCccd = new AacpStreamSummary();
         AacpStreamSummary afterPostCccdReads = new AacpStreamSummary();
-        AacpStreamSummary postSetter = new AacpStreamSummary();
+
         byte[] before2a = null;
         byte[] postCccd2a = null;
-        byte[] after2a = null;
+        byte[] final2a = null;
 
-        String prefix = "v23 attempt " + attempt + "/" + totalAttempts;
+        String prefix = "v29 attempt " + attempt + "/" + totalAttempts;
         try {
-            log("--- " + prefix + ": starting current-session capture path ---");
+            log("--- " + prefix + ": starting known-good current-session capture path ---");
             log(prefix + ": connecting AACP PSM " + AACP_PSM + ".");
             aacp = connectL2cap(device, AACP_PSM, true, prefix + " AACP");
             if (aacp == null) {
@@ -84,10 +86,10 @@ final class AacpV23Probe {
                 return false;
             }
 
-            preSetter.addAll(runAacpInit(aacp, prefix + " winning-path init"));
-            drainAacp(aacp, prefix + " post-init before ATT", 140, 2800, 140, preSetter);
+            preCccd.addAll(runAacpInit(aacp, prefix + " winning-path init"));
+            drainAacp(aacp, prefix + " post-init before ATT", 140, 2800, 140, preCccd);
 
-            log(prefix + ": connecting ATT PSM " + ATT_PSM + ".");
+            log(prefix + ": connecting ATT PSM " + ATT_PSM + " for read-only context only.");
             att = connectL2cap(device, ATT_PSM, false, prefix + " ATT");
             if (att == null) {
                 log(prefix + " abort: failed to connect ATT PSM " + ATT_PSM + ".");
@@ -95,16 +97,16 @@ final class AacpV23Probe {
             }
 
             drainAtt(att, prefix + " ATT stale after open", 24, 1300);
-            drainAacp(aacp, prefix + " after ATT open", 140, 4200, 160, preSetter);
+            drainAacp(aacp, prefix + " after ATT open", 140, 4200, 160, preCccd);
 
             attRead(att, HANDLE_SIBLING_21, prefix + " pre-CCCD sibling 0x0021");
             attRead(att, HANDLE_SIBLING_24, prefix + " pre-CCCD sibling 0x0024");
-            before2a = attRead(att, HANDLE_HEARING_CONFIG, prefix + " pre-CCCD 0x002A");
+            before2a = attRead(att, HANDLE_HEARING_CONFIG, prefix + " pre-CCCD 0x002A read-only context");
             if (before2a != null) {
                 log(prefix + " pre-CCCD 0x002A value: " + ByteUtil.hex(before2a));
                 decode2a(prefix + " pre-CCCD 0x002A decode", before2a);
             }
-            drainAacp(aacp, prefix + " after initial ATT reads", 140, 3300, 140, preSetter);
+            drainAacp(aacp, prefix + " after initial ATT reads", 140, 3300, 140, preCccd);
 
             log(prefix + ": enabling winning trigger: 0x0021 notify CCCD 0x0022 at handle 0x0022 = 01 00.");
             boolean cccdOk = attWriteRequest(att, HANDLE_CCCD_21, ByteUtil.bytes(0x01, 0x00), prefix + " enable winning CCCD 0x0022");
@@ -112,10 +114,10 @@ final class AacpV23Probe {
             drainAtt(att, prefix + " ATT after winning CCCD 0x0022", 40, 1900);
             drainAacp(aacp, prefix + " AACP direct drain after winning CCCD 0x0022", 140, 12000, 240, afterCccd);
 
-            log(prefix + ": continuing past the v21 abort point with the v20-style post-CCCD final ATT reads.");
+            log(prefix + ": continuing with v20-style post-CCCD ATT reads before any v29 matrix 0x0054.");
             attRead(att, HANDLE_SIBLING_21, prefix + " post-CCCD sibling 0x0021");
             attRead(att, HANDLE_SIBLING_24, prefix + " post-CCCD sibling 0x0024");
-            postCccd2a = attRead(att, HANDLE_HEARING_CONFIG, prefix + " post-CCCD 0x002A");
+            postCccd2a = attRead(att, HANDLE_HEARING_CONFIG, prefix + " post-CCCD 0x002A read-only context");
             if (postCccd2a != null) {
                 log(prefix + " post-CCCD 0x002A value: " + ByteUtil.hex(postCccd2a));
                 decode2a(prefix + " post-CCCD 0x002A decode", postCccd2a);
@@ -123,114 +125,66 @@ final class AacpV23Probe {
             }
             drainAacp(aacp, prefix + " final capture deep drain after post-CCCD reads", 140, 14500, 320, afterPostCccdReads);
 
-            summarizeStream(prefix + " pre-CCCD stream", preSetter);
+            summarizeStream(prefix + " pre-CCCD stream", preCccd);
             summarizeStream(prefix + " direct post-CCCD stream", afterCccd);
             summarizeStream(prefix + " post-CCCD-read deep stream", afterPostCccdReads);
 
-            PacketRecord echoSource = null;
-            String echoSourceLabel = null;
-            if (afterPostCccdReads.first53 != null) {
-                echoSource = afterPostCccdReads.first53;
-                echoSourceLabel = "post-CCCD final-read/deep-drain 0x0053";
-            } else if (afterCccd.first53 != null) {
-                echoSource = afterCccd.first53;
-                echoSourceLabel = "direct post-CCCD 0x0053";
-            } else if (preSetter.first53 != null) {
-                echoSource = preSetter.first53;
-                echoSourceLabel = "early current-session 0x0053";
-                log(prefix + " warning: using an early current-session 0x0053 because no post-CCCD 0x0053 arrived.");
+            PacketRecord context53 = chooseCurrentSession53(preCccd, afterCccd, afterPostCccdReads);
+            String context53Label = chooseCurrentSession53Label(preCccd, afterCccd, afterPostCccdReads);
+            if (context53 == null) {
+                log(prefix + " abort: no current-session AACP 0x0053 vector was captured. The 0x0054 matrix will not be sent.");
+                return false;
             }
+            byte[] original53 = context53.payload();
+            logPacketDetails(prefix + " selected " + context53Label + " 0x0054 matrix source", context53.packet);
+            if (!validate53ForMatrix(original53)) {
+                log(prefix + " abort: selected AACP 0x0053 payload failed the conservative v29 matrix guard. No 0x0054 matrix frames will be sent.");
+                return false;
+            }
+            log(prefix + " selected original 0x0053 payload length=" + original53.length + ", bytes=" + ByteUtil.hex(original53));
 
-            if (echoSource == null) {
-                log(prefix + " result: no current-session AACP 0x0053 payload was captured. No 0x0054 will be sent in this attempt.");
+            byte[] one0 = mutateOneFloat(original53, 0, Q8_STEP, prefix + " TEST float[0] Q8 canary");
+            byte[] one15 = mutateOneFloat(original53, 15, Q8_STEP, prefix + " TEST float[15] Q8 canary");
+            byte[] one31 = mutateOneFloat(original53, 31, Q8_STEP, prefix + " TEST float[31] Q8 canary");
+            byte[] all32 = mutateAllFloatsSameDirection(original53, Q8_STEP, prefix + " TEST all32 uniform Q8 canary");
+            if (one0 == null || one15 == null || one31 == null || all32 == null) {
+                log(prefix + " abort: at least one planned canary payload failed mutation guards. No partial matrix will be sent.");
                 return false;
             }
 
-            byte[] captured53Payload = echoSource.payload();
-            logPacketDetails(prefix + " selected " + echoSourceLabel + " echo source", echoSource.packet);
-            if (!validate53Payload(captured53Payload)) {
-                log(prefix + " abort: selected 0x0053 payload did not look like the expected vector payload. No 0x0054 was sent.");
-                return false;
-            }
+            AacpStreamSummary positiveOriginal = run54MatrixBlock(aacp, prefix, "POSITIVE CONTROL exact original 0x0053 via 0x0054", original53, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary test0 = run54MatrixBlock(aacp, prefix, "TEST 1 float[0] +Q8 via 0x0054", one0, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary restore0 = run54MatrixBlock(aacp, prefix, "RESTORE after TEST 1 exact original via 0x0054", original53, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary test15 = run54MatrixBlock(aacp, prefix, "TEST 2 float[15] +Q8 via 0x0054", one15, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary restore15 = run54MatrixBlock(aacp, prefix, "RESTORE after TEST 2 exact original via 0x0054", original53, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary test31 = run54MatrixBlock(aacp, prefix, "TEST 3 float[31] +Q8 via 0x0054", one31, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary restore31 = run54MatrixBlock(aacp, prefix, "RESTORE after TEST 3 exact original via 0x0054", original53, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary testAll = run54MatrixBlock(aacp, prefix, "TEST 4 all 32 floats +Q8 uniform via 0x0054", all32, original53, MATRIX_DRAIN_MS);
+            AacpStreamSummary restoreAll = run54MatrixBlock(aacp, prefix, "FINAL RESTORE exact original via 0x0054", original53, original53, MATRIX_DRAIN_MS);
 
-            byte[] bodyOnlyPayload = bodyOnly54Payload(captured53Payload);
-            if (bodyOnlyPayload == null) {
-                log(prefix + " abort: could not derive a safe body-only no-op payload from the captured 0x0053. No 0x0054 was sent.");
-                return false;
+            drainAtt(att, prefix + " ATT after v29 matrix", 40, 2200);
+            final2a = attRead(att, HANDLE_HEARING_CONFIG, prefix + " final 0x002A read-only context after v29 matrix");
+            if (final2a != null) {
+                log(prefix + " final 0x002A value: " + ByteUtil.hex(final2a));
+                decode2a(prefix + " final 0x002A decode", final2a);
+                if (postCccd2a != null) log(prefix + " final 0x002A equals pre-matrix 0x002A: " + ByteUtil.equalsBytes(postCccd2a, final2a));
             }
-            log(prefix + " body-only 0x0054 payload derived by stripping captured 0x0053 bytes[0..1].");
-            log(prefix + " body-only 0x0054 payload length=" + bodyOnlyPayload.length + ", first bytes=" + ByteUtil.hexShort(bodyOnlyPayload, 32));
-            log(prefix + " body-only 0x0054 payload float decode as body-without-length: " + ByteUtil.floatSummaryNoLen(bodyOnlyPayload));
+            drainAacp(aacp, prefix + " final deep drain after v29 matrix and final ATT read", 160, 6000, 160, new AacpStreamSummary());
 
-            byte[] echo54 = ByteUtil.concat(ByteUtil.bytes(0x04, 0x00, 0x04, 0x00, 0x54, 0x00), bodyOnlyPayload);
-            log(prefix + ": sending exactly one AACP 0x0054 body-only no-op candidate. Frame bytes: " + ByteUtil.hex(echo54));
-            sendAacp(aacp.getOutputStream(), echo54, prefix + " 0x0054 body-only no-op setter");
+            byte[] positive52 = positiveOriginal.first52 == null ? null : positiveOriginal.first52.payload();
+            log(prefix + " result matrix:");
+            logMatrixResult("POSITIVE original", positiveOriginal, positive52, original53);
+            logMatrixResult("TEST 1 float[0]+Q8", test0, positive52, original53);
+            logMatrixResult("RESTORE after TEST 1", restore0, positive52, original53);
+            logMatrixResult("TEST 2 float[15]+Q8", test15, positive52, original53);
+            logMatrixResult("RESTORE after TEST 2", restore15, positive52, original53);
+            logMatrixResult("TEST 3 float[31]+Q8", test31, positive52, original53);
+            logMatrixResult("RESTORE after TEST 3", restore31, positive52, original53);
+            logMatrixResult("TEST 4 all32+Q8 uniform", testAll, positive52, original53);
+            logMatrixResult("FINAL RESTORE", restoreAll, positive52, original53);
+            if (final2a != null && postCccd2a != null) log("  final ATT 0x002A equals pre-matrix: " + ByteUtil.equalsBytes(postCccd2a, final2a));
 
-            byte[] immediate = readOne(aacp.getInputStream(), 2000);
-            if (immediate != null) {
-                logPacket(prefix + " immediate packet after 0x0054", immediate);
-                postSetter.add(new PacketRecord(immediate, prefix + " immediate after 0x0054"));
-            } else {
-                log(prefix + " immediate packet after 0x0054: no packet.");
-            }
-            drainAacp(aacp, prefix + " after 0x0054 body-only no-op", 140, 10000, 220, postSetter);
-            drainAtt(att, prefix + " ATT after 0x0054 body-only no-op", 40, 1900);
-
-            attRead(att, HANDLE_SIBLING_21, prefix + " post-setter sibling 0x0021");
-            attRead(att, HANDLE_SIBLING_24, prefix + " post-setter sibling 0x0024");
-            after2a = attRead(att, HANDLE_HEARING_CONFIG, prefix + " post-setter 0x002A");
-            if (after2a != null) {
-                log(prefix + " post-setter 0x002A value: " + ByteUtil.hex(after2a));
-                decode2a(prefix + " post-setter 0x002A decode", after2a);
-            }
-
-            drainAacp(aacp, prefix + " final deep drain after post-setter reads", 140, 7000, 220, postSetter);
-            summarizeStream(prefix + " direct post-0x0054 stream", postSetter);
-
-            AacpStreamSummary postRefresh = new AacpStreamSummary();
-            log(prefix + ": issuing one benign post-0x0054 notification refresh request (same 0x000F FF FF FF FF used during init) to see whether the profile report refreshes. This is not counted as a direct 0x0054 ack.");
-            sendAacp(aacp.getOutputStream(), notificationRequestAll(), prefix + " post-0x0054 refresh request notifications mask FF FF FF FF");
-            byte[] refreshImmediate = readOne(aacp.getInputStream(), 1800);
-            if (refreshImmediate != null) {
-                logPacket(prefix + " immediate packet after post-0x0054 refresh request", refreshImmediate);
-                postRefresh.add(new PacketRecord(refreshImmediate, prefix + " immediate after post-0x0054 refresh request"));
-            } else {
-                log(prefix + " immediate packet after post-0x0054 refresh request: no packet.");
-            }
-            drainAacp(aacp, prefix + " after post-0x0054 refresh request", 140, 6500, 180, postRefresh);
-            summarizeStream(prefix + " post-0x0054 refresh-request stream", postRefresh);
-            if (postSetter.first53 != null) {
-                log(prefix + " direct post-0x0054 first 0x0053 equals selected captured 0x0053 payload: " + ByteUtil.equalsBytes(captured53Payload, postSetter.first53.payload()));
-            }
-            if (postRefresh.first53 != null) {
-                log(prefix + " refresh-request first 0x0053 equals selected captured 0x0053 payload: " + ByteUtil.equalsBytes(captured53Payload, postRefresh.first53.payload()));
-                logPacketDetails(prefix + " first refresh-request 0x0053", postRefresh.first53.packet);
-            }
-            if (postRefresh.first55 != null) logPacketDetails(prefix + " first refresh-request 0x0055", postRefresh.first55.packet);
-            if (postRefresh.first52 != null) logPacketDetails(prefix + " first refresh-request 0x0052", postRefresh.first52.packet);
-
-            log(prefix + " result summary:");
-            log("  selected echo source: " + echoSourceLabel);
-            log("  saw direct post-0x0054 0x0055 response candidate: " + postSetter.saw55());
-            log("  saw direct post-0x0054 0x0053 refresh: " + postSetter.saw53());
-            log("  saw direct post-0x0054 0x0052 status: " + postSetter.saw52());
-            log("  saw refresh-request 0x0055 candidate: " + postRefresh.saw55());
-            log("  saw refresh-request 0x0053 profile report: " + postRefresh.saw53());
-            log("  saw refresh-request 0x0052 status: " + postRefresh.saw52());
-            if (before2a != null && after2a != null) {
-                log("  ATT 0x002A changed after body-only no-op: " + (!ByteUtil.equalsBytes(before2a, after2a)));
-            } else {
-                log("  ATT 0x002A before/after comparison unavailable: before=" + (before2a != null) + ", after=" + (after2a != null));
-            }
-            if (postSetter.first55 != null) logPacketDetails(prefix + " first post-0x0054 0x0055", postSetter.first55.packet);
-            if (postSetter.first53 != null) logPacketDetails(prefix + " first post-0x0054 0x0053", postSetter.first53.packet);
-            if (postSetter.first52 != null) logPacketDetails(prefix + " first post-0x0054 0x0052", postSetter.first52.packet);
-
-            if (postSetter.saw55()) {
-                log(prefix + " interpretation: AACP 0x0054 body-only shape is a strong setter/commit candidate because a direct 0x0055 response appeared after the body-only no-op.");
-            } else {
-                log(prefix + " interpretation: no direct post-0x0054 0x0055 was observed. Check the refresh-request stream to see whether the profile report changed or stayed identical.");
-            }
+            interpretMatrix(prefix, positiveOriginal, test0, restore0, test15, restore15, test31, restore31, testAll, restoreAll);
             return true;
         } catch (Exception e) {
             log(prefix + " failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
@@ -240,6 +194,245 @@ final class AacpV23Probe {
             closeQuietly(aacp);
             log(prefix + " sockets closed.");
         }
+    }
+
+    private AacpStreamSummary run54MatrixBlock(BluetoothSocket aacp, String prefix, String blockLabel, byte[] payload, byte[] originalPayload, long waitMs) throws IOException {
+        AacpStreamSummary summary = new AacpStreamSummary();
+        log("--- " + prefix + " MATRIX BLOCK: " + blockLabel + " ---");
+        log(prefix + " " + blockLabel + " payload length=" + payload.length + ", equals original=" + ByteUtil.equalsBytes(payload, originalPayload));
+        log(prefix + " " + blockLabel + " payload float summary: " + ByteUtil.floatSummary(payload));
+        byte[] frame = aacp54FullPayload(payload);
+        log(prefix + " " + blockLabel + " 0x0054 frame bytes: " + ByteUtil.hex(frame));
+        long stimulus = SystemClock.elapsedRealtime();
+        sendAacp(aacp.getOutputStream(), frame, prefix + " " + blockLabel);
+        readImmediateRelative(aacp, prefix + " immediate packet after " + blockLabel, stimulus, blockLabel, summary);
+        drainAacpRelative(aacp, prefix + " after " + blockLabel, stimulus, blockLabel, 160, waitMs, 360, summary);
+        summarizeStream(prefix + " " + blockLabel + " stream", summary);
+        logFirstInteresting(prefix + " " + blockLabel, summary);
+        if (summary.first53 != null) {
+            log(prefix + " " + blockLabel + " first 0x0053 equals original selected 0x0053 payload: "
+                    + ByteUtil.equalsBytes(summary.first53.payload(), originalPayload));
+        }
+        return summary;
+    }
+
+    private void interpretMatrix(String prefix,
+                                 AacpStreamSummary positiveOriginal,
+                                 AacpStreamSummary test0,
+                                 AacpStreamSummary restore0,
+                                 AacpStreamSummary test15,
+                                 AacpStreamSummary restore15,
+                                 AacpStreamSummary test31,
+                                 AacpStreamSummary restore31,
+                                 AacpStreamSummary testAll,
+                                 AacpStreamSummary restoreAll) {
+        boolean positive = positiveOriginal.saw52();
+        boolean anySingle = test0.saw52() || test15.saw52() || test31.saw52();
+        boolean allUniform = testAll.saw52();
+        boolean allRestores = restore0.saw52() && restore15.saw52() && restore31.saw52() && restoreAll.saw52();
+        log(prefix + " interpretation inputs: positiveOriginalSaw52=" + positive
+                + ", anySingleSlotMutationSaw52=" + anySingle
+                + ", all32UniformMutationSaw52=" + allUniform
+                + ", allRestoresSaw52=" + allRestores + ".");
+        if (!positive) {
+            log(prefix + " interpretation: positive original 0x0054 did not produce 0x0052 in this run. Treat the matrix as inconclusive and rerun before changing hypotheses.");
+        } else if (!allRestores) {
+            log(prefix + " interpretation: positive original worked, but at least one original restore did not produce 0x0052. The oracle/state may have cooled down, rate-limited, or become timing-sensitive; repeat with longer restore waits before trusting mutation negatives.");
+        } else if (!anySingle && allUniform) {
+            log(prefix + " interpretation: single-slot mutations failed but all-32 uniform mutation produced 0x0052. That strongly suggests a vector-level constraint such as uniformity/shape consistency rather than a completely read-only setter.");
+        } else if (anySingle) {
+            log(prefix + " interpretation: at least one single-slot mutation produced 0x0052. Compare which slot(s) accepted; that slot class is likely writable/validated.");
+        } else if (!anySingle && !allUniform) {
+            log(prefix + " interpretation: exact-original 0x0054 and restores are accepted, but every Q8 mutation shape was silent. That points to strict validation, missing authorization/commit context, or 0x0054 being an integrity-checked setter rather than a free profile writer.");
+        } else {
+            log(prefix + " interpretation: mixed result; inspect per-block first 0x0052 payloads and timings above.");
+        }
+    }
+
+    private PacketRecord chooseCurrentSession53(AacpStreamSummary pre, AacpStreamSummary afterCccd, AacpStreamSummary afterReads) {
+        if (afterReads != null && afterReads.first53 != null) return afterReads.first53;
+        if (afterCccd != null && afterCccd.first53 != null) return afterCccd.first53;
+        if (pre != null && pre.first53 != null) return pre.first53;
+        return null;
+    }
+
+    private String chooseCurrentSession53Label(AacpStreamSummary pre, AacpStreamSummary afterCccd, AacpStreamSummary afterReads) {
+        if (afterReads != null && afterReads.first53 != null) return "post-CCCD final-read/deep-drain 0x0053";
+        if (afterCccd != null && afterCccd.first53 != null) return "direct post-CCCD 0x0053";
+        if (pre != null && pre.first53 != null) return "early current-session 0x0053";
+        return "none";
+    }
+
+    private boolean validate53ForMatrix(byte[] payload) {
+        if (payload == null) return false;
+        int declared = payload.length >= 2 ? ByteUtil.u16le(payload, 0) : -1;
+        log("v29 selected AACP 0x0053 matrix validation: len=" + payload.length + ", declared/body-ish=" + declared + ", float summary=" + ByteUtil.floatSummary(payload));
+        if (payload.length < 10) {
+            log("v29 matrix guard: refusing because payload is too short.");
+            return false;
+        }
+        if (declared != payload.length - 2) {
+            log("v29 matrix guard: refusing because declared/body-ish length " + declared + " does not equal payloadLen-2 " + (payload.length - 2) + ".");
+            return false;
+        }
+        if (ByteUtil.u8(payload[2]) != 0x02 || ByteUtil.u8(payload[3]) != 0x00 || ByteUtil.u8(payload[4]) != 0x02 || ByteUtil.u8(payload[5]) != 0x02) {
+            log("v29 matrix guard: refusing because prefix bytes [2..5] are not observed 02 00 02 02. Prefix="
+                    + ByteUtil.hex(ByteUtil.copyOfRange(payload, 2, Math.min(payload.length, 6))));
+            return false;
+        }
+        if (((payload.length - 6) % 4) != 0) {
+            log("v29 matrix guard: refusing because bytes after prefix are not an integer float32 count.");
+            return false;
+        }
+        int count = floatCount53(payload);
+        if (count != 32) {
+            log("v29 matrix guard: refusing because float32 count is " + count + ", expected observed count 32.");
+            return false;
+        }
+        for (int i = 0; i < count; i++) {
+            float v = floatAt(payload, i);
+            if (!Float.isFinite(v) || v < 0.0f || v > 1.0f) {
+                log("v29 matrix guard: refusing because float[" + i + "]=" + v + " is not finite in [0,1].");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private byte[] mutateOneFloat(byte[] original, int index, float step, String label) {
+        if (!validate53ForMatrix(original)) return null;
+        int count = floatCount53(original);
+        if (index < 0 || index >= count) {
+            log(label + ": refusing because index " + index + " is outside float count " + count + ".");
+            return null;
+        }
+        float old = floatAt(original, index);
+        float delta = chooseDelta(old, step);
+        if (Float.isNaN(delta)) {
+            log(label + ": refusing because +/-" + step + " would leave [0,1] for original value " + old + ".");
+            return null;
+        }
+        byte[] out = ByteUtil.copyOfRange(original, 0, original.length);
+        int off = floatOffset(index);
+        float neu = old + delta;
+        byte[] before = ByteUtil.copyOfRange(out, off, off + 4);
+        writeF32le(out, off, neu);
+        byte[] after = ByteUtil.copyOfRange(out, off, off + 4);
+        log(label + String.format(Locale.US,
+                ": changes only float[%d] at payload offset %d: %.8f (%s) -> %.8f (%s), delta=%.8f",
+                index, off, old, ByteUtil.hex(before), neu, ByteUtil.hex(after), delta));
+        log(label + " payload bytes=" + ByteUtil.hex(out));
+        return out;
+    }
+
+    private byte[] mutateAllFloatsSameDirection(byte[] original, float step, String label) {
+        if (!validate53ForMatrix(original)) return null;
+        int count = floatCount53(original);
+        boolean canPlus = true;
+        boolean canMinus = true;
+        for (int i = 0; i < count; i++) {
+            float v = floatAt(original, i);
+            if (v + step > 1.0f) canPlus = false;
+            if (v - step < 0.0f) canMinus = false;
+        }
+        float delta;
+        if (canPlus) delta = step;
+        else if (canMinus) delta = -step;
+        else {
+            log(label + ": refusing because neither +Q8 nor -Q8 is valid for every float.");
+            return null;
+        }
+        byte[] out = ByteUtil.copyOfRange(original, 0, original.length);
+        for (int i = 0; i < count; i++) {
+            float old = floatAt(original, i);
+            writeF32le(out, floatOffset(i), old + delta);
+        }
+        log(label + String.format(Locale.US,
+                ": changes all %d floats by the same delta %.8f; first %.8f -> %.8f, last %.8f -> %.8f",
+                count, delta, floatAt(original, 0), floatAt(out, 0), floatAt(original, count - 1), floatAt(out, count - 1)));
+        log(label + " payload bytes=" + ByteUtil.hex(out));
+        return out;
+    }
+
+    private float chooseDelta(float old, float step) {
+        if (old + step <= 1.0f) return step;
+        if (old - step >= 0.0f) return -step;
+        return Float.NaN;
+    }
+
+    private int floatCount53(byte[] payload) {
+        return payload == null || payload.length < 6 ? 0 : (payload.length - 6) / 4;
+    }
+
+    private int floatOffset(int index) {
+        return 6 + index * 4;
+    }
+
+    private float floatAt(byte[] payload, int index) {
+        return ByteUtil.f32le(payload, floatOffset(index));
+    }
+
+    private void writeF32le(byte[] b, int off, float value) {
+        int bits = Float.floatToIntBits(value);
+        b[off] = (byte) (bits & 0xFF);
+        b[off + 1] = (byte) ((bits >> 8) & 0xFF);
+        b[off + 2] = (byte) ((bits >> 16) & 0xFF);
+        b[off + 3] = (byte) ((bits >> 24) & 0xFF);
+    }
+
+    private byte[] aacp54FullPayload(byte[] payload) {
+        return ByteUtil.concat(ByteUtil.bytes(0x04, 0x00, 0x04, 0x00, 0x54, 0x00), payload == null ? new byte[0] : payload);
+    }
+
+    private void readImmediateRelative(BluetoothSocket socket, String label, long stimulusMs, String stimulusLabel, AacpStreamSummary collector) throws IOException {
+        byte[] p = readOne(socket.getInputStream(), 2200);
+        if (p != null) {
+            logPacket(label + rel(stimulusMs, stimulusLabel), p);
+            if (collector != null) collector.add(new PacketRecord(p, label));
+        } else {
+            log(label + rel(stimulusMs, stimulusLabel) + ": no packet.");
+        }
+    }
+
+    private void drainAacpRelative(BluetoothSocket socket, String label, long stimulusMs, String stimulusLabel, long perReadMs, long maxTotalMs, int maxPackets, AacpStreamSummary collector) throws IOException {
+        InputStream in = socket.getInputStream();
+        long start = SystemClock.elapsedRealtime();
+        int count = 0;
+        while (count < maxPackets && SystemClock.elapsedRealtime() - start < maxTotalMs) {
+            byte[] p = readOne(in, perReadMs);
+            if (p == null) continue;
+            count++;
+            logPacket("AACP drain " + label + " packet " + count + rel(stimulusMs, stimulusLabel), p);
+            if (collector != null) collector.add(new PacketRecord(p, label));
+        }
+        if (count == 0) log("AACP drain " + label + rel(stimulusMs, stimulusLabel) + ": no packets.");
+    }
+
+    private String rel(long stimulusMs, String stimulusLabel) {
+        long delta = SystemClock.elapsedRealtime() - stimulusMs;
+        return " (+" + delta + " ms since " + stimulusLabel + ")";
+    }
+
+    private void logMatrixResult(String label, AacpStreamSummary s, byte[] positive52Payload, byte[] selected53Payload) {
+        log("  " + label + ": packets=" + s.packets.size()
+                + ", saw0x52=" + s.saw52()
+                + ", saw0x53=" + s.saw53()
+                + ", saw0x55=" + s.saw55()
+                + ", commands=" + s.commandCountString());
+        if (s.first52 != null) {
+            byte[] p52 = s.first52.payload();
+            log("  " + label + ": first 0x0052 payload=" + ByteUtil.hex(p52));
+            if (positive52Payload != null) log("  " + label + ": first 0x0052 equals positive-control first 0x0052: " + ByteUtil.equalsBytes(p52, positive52Payload));
+        }
+        if (s.first53 != null && selected53Payload != null) {
+            log("  " + label + ": first 0x0053 equals selected current-session 0x0053 payload: " + ByteUtil.equalsBytes(s.first53.payload(), selected53Payload));
+        }
+    }
+
+    private void logFirstInteresting(String label, AacpStreamSummary s) {
+        if (s.first52 != null) logPacketDetails(label + " first 0x0052", s.first52.packet);
+        if (s.first53 != null) logPacketDetails(label + " first 0x0053", s.first53.packet);
+        if (s.first55 != null) logPacketDetails(label + " first 0x0055", s.first55.packet);
     }
 
     private AacpStreamSummary runAacpInit(BluetoothSocket socket, String label) throws IOException {
@@ -286,31 +479,6 @@ final class AacpV23Probe {
 
     private byte[] notificationRequestAll() {
         return ByteUtil.concat(ByteUtil.bytes(0x04, 0x00, 0x04, 0x00, 0x0F, 0x00), ByteUtil.bytes(0xFF, 0xFF, 0xFF, 0xFF));
-    }
-
-    private byte[] bodyOnly54Payload(byte[] captured53Payload) {
-        if (captured53Payload == null || captured53Payload.length < 10) return null;
-        int declared = ByteUtil.u16le(captured53Payload, 0);
-        if (declared != captured53Payload.length - 2) {
-            log("v23 body-only guard: captured 0x0053 declared/body-ish length " + declared
-                    + " does not equal payloadLen-2 " + (captured53Payload.length - 2) + ". Refusing to strip.");
-            return null;
-        }
-        byte[] body = ByteUtil.copyOfRange(captured53Payload, 2, captured53Payload.length);
-        if (body.length < 8) return null;
-        return body;
-    }
-
-    private boolean validate53Payload(byte[] payload) {
-        if (payload == null) return false;
-        int declared = payload.length >= 2 ? ByteUtil.u16le(payload, 0) : -1;
-        log("v23 selected 0x0053 payload validation: len=" + payload.length + ", declared/body-ish=" + declared + ", float summary=" + ByteUtil.floatSummary(payload));
-        if (payload.length < 10) return false;
-        if (declared <= 0) return false;
-        if (declared != payload.length - 2) {
-            log("v23 warning: 0x0053 declared/body-ish length does not equal payloadLen-2. Continuing because this is an echo of an observed packet, not a synthetic payload.");
-        }
-        return true;
     }
 
     private void sendAacp(OutputStream out, byte[] frame, String label) throws IOException {
