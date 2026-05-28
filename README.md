@@ -65,3 +65,7 @@ The default probe only performs connection tests and ATT read requests. Avoid ra
 ## License
 
 GPL-3.0-or-later. This project is intended to interoperate with LibrePods and to keep derivative diagnostic work compatible with LibrePods' license.
+
+## v2 workflow note
+
+This repo uses `android-actions/setup-android@v3` before calling `sdkmanager`. This is required on GitHub-hosted runners because `sdkmanager` may not be on PATH by default.
