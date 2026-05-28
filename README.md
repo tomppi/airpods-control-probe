@@ -1,10 +1,10 @@
-# AirPods Control Probe v16
+# AirPods Control Probe v17
 
 Android probe app for GitHub-hosted runners.
 
 This repo is set up to build on GitHub Actions using Ubuntu, JDK 17, Gradle 8.10.2, Android SDK 35, and a CI-generated release keystore.
 
-## What v16 tests
+## What v17 tests
 
 v15 showed that raw ATT writes to the hearing-aid region did not persist:
 
@@ -14,7 +14,7 @@ v15 showed that raw ATT writes to the hearing-aid region did not persist:
 - sibling `0x0028` write-request
 - notification/indication combinations around `0x002B`, `0x002F`, `0x0032`, `0x0035`, and `0x0038`
 
-v16 therefore focuses on the only new clue from v15: an AACP packet with command/message `0x0052` observed after the full indication setup.
+v17 therefore focuses on the only new clue from v15: an AACP packet with command/message `0x0052` observed after the full indication setup.
 
 The probe:
 
@@ -39,4 +39,9 @@ gradle --no-daemon :app:assembleDebug :app:assembleRelease \
   -PAIRPODS_PROBE_KEY_PASSWORD=android
 ```
 
-APKs are uploaded as the `airpods-control-probe-v16-apks` artifact.
+APKs are uploaded as the `airpods-control-probe-v17-apks` artifact.
+
+
+## v17 notes
+
+v17 pivots from the failed AACP 0x52 commit idea to the real v16 signal: AACP 0x0053 profile/vector packets, AACP 0x0055 status packets, and large AACP 0x0017 HID/service descriptor traffic after enabling the notify path. It performs deeper passive capture and only no-op exact echoes of observed 0x53/0x55 packets.

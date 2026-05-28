@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="AirPods Probe v16"
+        android:label="AirPods Probe v17"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
