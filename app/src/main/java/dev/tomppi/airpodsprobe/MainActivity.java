@@ -160,7 +160,7 @@ public final class MainActivity extends Activity {
         root.addView(hearingMethodExperiment, new LinearLayout.LayoutParams(-1, -2));
 
         hearingMapExperiment = new CheckBox(this);
-        hearingMapExperiment.setText("EXPERIMENTAL v13: map ATT 0x28–0x2F + monitor AACP/ATT after 0x2A write");
+        hearingMapExperiment.setText("EXPERIMENTAL v14: robust ATT map + 0x2A notify/indicate monitor");
         hearingMapExperiment.setChecked(false);
         root.addView(hearingMapExperiment, new LinearLayout.LayoutParams(-1, -2));
 

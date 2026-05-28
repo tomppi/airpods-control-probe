@@ -270,31 +270,31 @@ final class AirPodsProbe {
 
 
     private void testHearingAidV13MapAndMonitor(BluetoothDevice device) {
-        log.line("--- v13 AACP hearing-capability + ATT map/notification monitor ---");
-        log.line("This test does not randomize payloads. It maps ATT handles around 0x002A/0x002B, enables CCCD modes on 0x002B, then watches AACP/ATT after a controlled 0x2A write.");
-        log.line("Goal: determine whether hearing-aid saving needs a nearby ATT handle, notification/indication, or an AACP commit/status message.");
+        log.line("--- v14 AACP/ATT hearing-aid map + robust notification/indication monitor ---");
+        log.line("v14 fixes the v13 response-order problem: it filters stale ATT 0x13 write responses, uses 0x52 for 0x2A because the characteristic advertises write-no-response, and also enables the nearby indicate channels 0x2E/0x31/0x34.");
+        log.line("Goal: determine whether 0x2A needs notification subscription, command-channel indications, or a separate AACP status/commit path.");
 
         ControlSession session = null;
         byte[] baseline = null;
         try {
-            session = openControlSession(device, "v13 baseline/map");
+            session = openControlSession(device, "v14 baseline/map");
             if (session.attSocket == null) {
-                log.line("v13 aborted: could not open ATT for baseline/map.");
+                log.line("v14 aborted: could not open ATT for baseline/map.");
                 return;
             }
 
-            log.line("v13: draining AACP after init to catch capability/status messages.");
-            drainAacpResponsesVerbose(session.aacpSocket, 6, 650);
+            log.line("v14: draining AACP after init to catch capability/status messages.");
+            drainAacpResponsesVerbose(session.aacpSocket, 8, 650);
 
             runAttDiscoveryAroundHearing(session.attSocket);
-            readNearbyAttHandles(session.attSocket, 0x0028, 0x002F);
+            readNearbyAttHandles(session.attSocket, 0x0020, 0x0035);
 
-            baseline = attReadValue(session.attSocket, 0x002A, "v13 baseline HEARING_AID_CONFIG");
+            baseline = attReadValueExpected(session.attSocket, 0x002A, "v14 baseline HEARING_AID_CONFIG");
             if (baseline == null || baseline.length < 12) {
-                log.line("v13 aborted: could not read baseline 0x002A or value too short.");
+                log.line("v14 aborted: could not read baseline 0x002A or value too short.");
                 return;
             }
-            log.line("v13 baseline 0x2A value: " + Hex.bytes(baseline, baseline.length));
+            log.line("v14 baseline 0x2A value: " + Hex.bytes(baseline, baseline.length));
         } finally {
             closeSession(session);
         }
@@ -302,28 +302,27 @@ final class AirPodsProbe {
         byte[] minimalMutation = baseline.clone();
         minimalMutation[4] = (byte) (minimalMutation[4] == 0 ? 0x01 : 0x00);
 
-        int[] cccdModes = new int[] {0x0001, 0x0002, 0x0003};
-        String[] cccdLabels = new String[] {"notifications only 01 00", "indications only 02 00", "notifications+indications 03 00"};
-        for (int i = 0; i < cccdModes.length; i++) {
-            runV13CccdCommitProbe(device, cccdModes[i], cccdLabels[i], baseline, minimalMutation);
-        }
+        runV14RobustProbe(device, "0x2A write-command only, no CCCD", baseline, minimalMutation, -1, false, true);
+        runV14RobustProbe(device, "0x2A notify CCCD 0x002B=01 00 + write-command", baseline, minimalMutation, 0x0001, false, true);
+        runV14RobustProbe(device, "0x2A notify CCCD + command indication CCCDs 0x002F/0x0032/0x0035 + write-command", baseline, minimalMutation, 0x0001, true, true);
+        runV14RobustProbe(device, "0x2A notify CCCD + command indications + legacy write-request", baseline, minimalMutation, 0x0001, true, false);
 
         ControlSession finalSession = null;
         try {
-            finalSession = openControlSession(device, "v13 final check");
+            finalSession = openControlSession(device, "v14 final check");
             if (finalSession.attSocket != null) {
-                byte[] finalValue = attReadValue(finalSession.attSocket, 0x002A, "v13 final HEARING_AID_CONFIG");
-                log.line("v13 final value equals baseline: " + Arrays.equals(baseline, finalValue));
+                byte[] finalValue = attReadValueExpected(finalSession.attSocket, 0x002A, "v14 final HEARING_AID_CONFIG");
+                log.line("v14 final value equals baseline: " + Arrays.equals(baseline, finalValue));
             }
         } finally {
             closeSession(finalSession);
         }
 
-        log.line("v13 AACP/ATT map + monitor test complete.");
+        log.line("v14 AACP/ATT map + robust monitor test complete.");
     }
 
-    private void runV13CccdCommitProbe(BluetoothDevice device, int cccdMode, String modeLabel, byte[] baseline, byte[] mutated) {
-        String label = "v13 CCCD " + modeLabel;
+    private void runV14RobustProbe(BluetoothDevice device, String modeLabel, byte[] baseline, byte[] mutated, int cccd2aMode, boolean enableCommandIndications, boolean useWriteCommandFor2A) {
+        String label = "v14 " + modeLabel;
         log.line("--- " + label + " ---");
         ControlSession session = null;
         try {
@@ -333,30 +332,45 @@ final class AirPodsProbe {
                 return;
             }
 
-            log.line(label + ": enabling 0x002B with mode " + String.format(Locale.US, "%02X %02X", cccdMode & 0xFF, (cccdMode >> 8) & 0xFF));
-            byte[] mode = new byte[] {(byte) (cccdMode & 0xFF), (byte) ((cccdMode >> 8) & 0xFF)};
-            byte[] cccdResponse = attWriteRequest(session.attSocket, 0x002B, mode, label + " write CCCD/control 0x002B");
-            log.line(label + ": 0x002B write response: " + (cccdResponse == null ? "null" : Hex.bytes(cccdResponse, cccdResponse.length)));
+            drainAttQueueBrief(session.attSocket, label + " initial ATT drain", 4, 120);
 
-            drainAttUnsolicited(session.attSocket, label + " after 0x002B enable", 4, 650);
-            drainAacpResponsesVerbose(session.aacpSocket, 4, 650);
+            if (cccd2aMode >= 0) {
+                byte[] mode = new byte[] {(byte) (cccd2aMode & 0xFF), (byte) ((cccd2aMode >> 8) & 0xFF)};
+                log.line(label + ": enabling 0x002A notifications via presumed CCCD/control 0x002B = " + Hex.bytes(mode, mode.length));
+                attWriteRequestExpected(session.attSocket, 0x002B, mode, label + " write 0x002B");
+            }
 
-            byte[] before = attReadValue(session.attSocket, 0x002A, label + " before 0x2A write");
+            if (enableCommandIndications) {
+                byte[] indications = new byte[] {0x02, 0x00};
+                int[] cccds = new int[] {0x002F, 0x0032, 0x0035};
+                for (int h : cccds) {
+                    log.line(String.format(Locale.US, "%s: enabling indications on descriptor 0x%04X = 02 00", label, h));
+                    attWriteRequestExpected(session.attSocket, h, indications, label + String.format(Locale.US, " write indication CCCD 0x%04X", h));
+                }
+            }
+
+            drainAttQueueBrief(session.attSocket, label + " after CCCD writes", 8, 150);
+            drainAacpResponsesVerbose(session.aacpSocket, 6, 500);
+
+            byte[] before = attReadValueExpected(session.attSocket, 0x002A, label + " before 0x2A write");
             log.line(label + ": before-write equals baseline: " + Arrays.equals(baseline, before));
 
             log.line(label + ": writing controlled 0x2A mutation: " + Hex.bytes(mutated, mutated.length));
-            byte[] wr = attWriteRequest(session.attSocket, 0x002A, mutated, label + " controlled 0x2A write");
-            log.line(label + ": 0x2A write response: " + (wr == null ? "null" : Hex.bytes(wr, wr.length)));
+            if (useWriteCommandFor2A) {
+                attWriteCommandNoRead(session.attSocket, 0x002A, mutated, label + " 0x2A Write Command 0x52");
+            } else {
+                attWriteRequestExpected(session.attSocket, 0x002A, mutated, label + " 0x2A Write Request 0x12");
+            }
 
-            log.line(label + ": draining ATT unsolicited packets after 0x2A write.");
-            drainAttUnsolicited(session.attSocket, label + " after 0x2A write", 8, 700);
-            log.line(label + ": draining AACP packets after 0x2A write.");
-            drainAacpResponsesVerbose(session.aacpSocket, 8, 700);
+            log.line(label + ": draining ATT after 0x2A write for notifications/indications/stale responses.");
+            drainAttUnsolicited(session.attSocket, label + " after 0x2A write", 12, 900);
+            log.line(label + ": draining AACP after 0x2A write for status/commit hints.");
+            drainAacpResponsesVerbose(session.aacpSocket, 12, 900);
 
             int[] waits = new int[] {0, 250, 1000, 3000};
             for (int wait : waits) {
                 if (wait > 0) sleep(wait);
-                byte[] rb = attReadValue(session.attSocket, 0x002A, label + " readback after " + wait + "ms");
+                byte[] rb = attReadValueExpected(session.attSocket, 0x002A, label + " readback after " + wait + "ms");
                 if (rb == null) {
                     log.line(label + ": readback failed after " + wait + "ms; stopping this mode.");
                     break;
@@ -364,9 +378,9 @@ final class AirPodsProbe {
                 log.line(label + ": readback after " + wait + "ms equals mutated: " + Arrays.equals(mutated, rb) + ", equals baseline: " + Arrays.equals(baseline, rb));
             }
 
-            log.line(label + ": attempting final baseline restore write, only in case mutation persisted.");
-            attWriteRequest(session.attSocket, 0x002A, baseline, label + " final restore 0x2A");
-            sleep(300);
+            log.line(label + ": final baseline restore attempt using 0x52 write-command.");
+            attWriteCommandNoRead(session.attSocket, 0x002A, baseline, label + " final restore 0x2A 0x52");
+            sleep(250);
         } catch (Throwable t) {
             log.line(label + ": failed: " + t.getClass().getSimpleName() + ": " + rootMessage(t));
         } finally {
@@ -375,11 +389,175 @@ final class AirPodsProbe {
         }
     }
 
+
+    private byte[] attReadValueExpected(BluetoothSocket socket, int handle, String name) {
+        drainAttQueueBrief(socket, name + " pre-read drain", 4, 80);
+        byte[] request = new byte[] {0x0A, (byte) (handle & 0xFF), (byte) ((handle >> 8) & 0xFF)};
+        log.line(String.format(Locale.US, "ATT robust read %s handle 0x%04X request: %s", name, handle, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            long deadline = System.currentTimeMillis() + READ_TIMEOUT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                int remain = (int) Math.max(100, Math.min(700, deadline - System.currentTimeMillis()));
+                byte[] response = readWithTimeout(socket, remain);
+                if (response == null) continue;
+                int opcode = response.length > 0 ? (response[0] & 0xFF) : -1;
+                log.line(String.format(Locale.US, "ATT robust read 0x%04X candidate opcode 0x%02X: %s", handle, opcode, Hex.bytes(response, response.length)));
+                if (opcode == 0x0B) {
+                    byte[] value = new byte[Math.max(0, response.length - 1)];
+                    if (value.length > 0) System.arraycopy(response, 1, value, 0, value.length);
+                    log.line(String.format(Locale.US, "ATT robust read 0x%04X parsed value: %s", handle, Hex.bytes(value, value.length)));
+                    return value;
+                }
+                if (opcode == 0x01 && response.length >= 5 && (response[1] & 0xFF) == 0x0A && le16(response, 2) == handle) {
+                    log.line("ATT robust read target returned error: " + parseAttError(response));
+                    return null;
+                }
+                if (opcode == 0x13) {
+                    log.line("ATT robust read ignored stale Write Response 0x13.");
+                    continue;
+                }
+                if (opcode == 0x1B && response.length >= 3) {
+                    log.line(String.format(Locale.US, "ATT robust read saw notification handle 0x%04X value %s", le16(response, 1), Hex.bytes(Arrays.copyOfRange(response, 3, response.length), Math.max(0, response.length - 3))));
+                    continue;
+                }
+                if (opcode == 0x1D && response.length >= 3) {
+                    log.line(String.format(Locale.US, "ATT robust read saw indication handle 0x%04X value %s; sending confirmation 0x1E", le16(response, 1), Hex.bytes(Arrays.copyOfRange(response, 3, response.length), Math.max(0, response.length - 3))));
+                    try { writeRaw(socket, new byte[] {0x1E}); } catch (IOException e) { log.line("ATT confirmation failed: " + e.getMessage()); }
+                    continue;
+                }
+                log.line("ATT robust read ignored unrelated packet while waiting for read response.");
+            }
+            log.line(String.format(Locale.US, "ATT robust read 0x%04X: no target read response within %d ms", handle, READ_TIMEOUT_MS));
+            return null;
+        } catch (Exception e) {
+            log.line(String.format(Locale.US, "ATT robust read 0x%04X failed: %s: %s", handle, e.getClass().getSimpleName(), e.getMessage()));
+            return null;
+        }
+    }
+
+    private byte[] attWriteRequestExpected(BluetoothSocket socket, int handle, byte[] value, String name) {
+        drainAttQueueBrief(socket, name + " pre-write drain", 4, 80);
+        byte[] request = new byte[3 + value.length];
+        request[0] = 0x12;
+        request[1] = (byte) (handle & 0xFF);
+        request[2] = (byte) ((handle >> 8) & 0xFF);
+        System.arraycopy(value, 0, request, 3, value.length);
+        log.line(String.format(Locale.US, "ATT robust write-request %s handle 0x%04X request: %s", name, handle, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            long deadline = System.currentTimeMillis() + READ_TIMEOUT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                int remain = (int) Math.max(100, Math.min(700, deadline - System.currentTimeMillis()));
+                byte[] response = readWithTimeout(socket, remain);
+                if (response == null) continue;
+                int opcode = response.length > 0 ? (response[0] & 0xFF) : -1;
+                log.line(String.format(Locale.US, "ATT robust write 0x%04X candidate opcode 0x%02X: %s", handle, opcode, Hex.bytes(response, response.length)));
+                if (opcode == 0x13) return response;
+                if (opcode == 0x01 && response.length >= 5 && (response[1] & 0xFF) == 0x12 && le16(response, 2) == handle) {
+                    log.line("ATT robust write target returned error: " + parseAttError(response));
+                    return response;
+                }
+                if (opcode == 0x1B && response.length >= 3) {
+                    log.line(String.format(Locale.US, "ATT robust write saw notification handle 0x%04X value %s", le16(response, 1), Hex.bytes(Arrays.copyOfRange(response, 3, response.length), Math.max(0, response.length - 3))));
+                    continue;
+                }
+                if (opcode == 0x1D && response.length >= 3) {
+                    log.line(String.format(Locale.US, "ATT robust write saw indication handle 0x%04X value %s; sending confirmation 0x1E", le16(response, 1), Hex.bytes(Arrays.copyOfRange(response, 3, response.length), Math.max(0, response.length - 3))));
+                    try { writeRaw(socket, new byte[] {0x1E}); } catch (IOException e) { log.line("ATT confirmation failed: " + e.getMessage()); }
+                    continue;
+                }
+                log.line("ATT robust write ignored unrelated packet while waiting for 0x13/error.");
+            }
+            log.line(String.format(Locale.US, "ATT robust write 0x%04X: no write response within %d ms", handle, READ_TIMEOUT_MS));
+            return null;
+        } catch (Exception e) {
+            log.line(String.format(Locale.US, "ATT robust write 0x%04X failed: %s: %s", handle, e.getClass().getSimpleName(), e.getMessage()));
+            return null;
+        }
+    }
+
+    private void attWriteCommandNoRead(BluetoothSocket socket, int handle, byte[] value, String name) {
+        drainAttQueueBrief(socket, name + " pre-command drain", 4, 80);
+        byte[] request = new byte[3 + value.length];
+        request[0] = 0x52;
+        request[1] = (byte) (handle & 0xFF);
+        request[2] = (byte) ((handle >> 8) & 0xFF);
+        System.arraycopy(value, 0, request, 3, value.length);
+        log.line(String.format(Locale.US, "ATT robust write-command %s handle 0x%04X request: %s", name, handle, Hex.bytes(request, request.length)));
+        try {
+            writeRaw(socket, request);
+            log.line("ATT robust write-command sent; no immediate ATT response expected.");
+        } catch (Exception e) {
+            log.line(String.format(Locale.US, "ATT robust write-command 0x%04X failed: %s: %s", handle, e.getClass().getSimpleName(), e.getMessage()));
+        }
+    }
+
+    private void drainAttQueueBrief(BluetoothSocket socket, String label, int maxPackets, int timeoutMs) {
+        for (int i = 0; i < maxPackets; i++) {
+            byte[] p = readWithTimeout(socket, timeoutMs);
+            if (p == null) {
+                if (i > 0) log.line(label + ": drained " + i + " stale ATT packet(s).");
+                return;
+            }
+            int opcode = p.length > 0 ? (p[0] & 0xFF) : -1;
+            log.line(label + ": drained stale ATT packet opcode 0x" + String.format(Locale.US, "%02X", opcode) + ": " + Hex.bytes(p, p.length));
+            if (opcode == 0x1D && p.length >= 3) {
+                try { writeRaw(socket, new byte[] {0x1E}); } catch (IOException ignored) {}
+            }
+        }
+    }
+
     private void runAttDiscoveryAroundHearing(BluetoothSocket socket) {
-        log.line("--- v13 ATT discovery around 0x0028–0x002F ---");
-        attFindInformation(socket, 0x0028, 0x002F);
-        attReadByTypeCharacteristicDeclarations(socket, 0x0020, 0x0035);
-        attFindInformation(socket, 0x0001, 0x0040);
+        log.line("--- v14 ATT discovery around hearing handles ---");
+        log.line("v14 note: 0x002A advertises read + write-no-response + notify, so 0x52 is the correct write form to test. 0x002E/0x0031/0x0034 advertise write + indicate and may be command/status channels.");
+        attFindInformation(socket, 0x0020, 0x0038);
+        attFindInformationPaged(socket, 0x0020, 0x0038);
+        attReadByTypeCharacteristicDeclarations(socket, 0x0020, 0x0038);
+        attFindInformationPaged(socket, 0x0001, 0x0040);
+    }
+
+
+    private void attFindInformationPaged(BluetoothSocket socket, int start, int end) {
+        log.line(String.format(Locale.US, "ATT Find Information paged 0x%04X–0x%04X", start, end));
+        int current = start;
+        int guard = 0;
+        while (current <= end && guard++ < 20) {
+            byte[] request = new byte[] {0x04, (byte)(current & 0xFF), (byte)((current >> 8) & 0xFF), (byte)(end & 0xFF), (byte)((end >> 8) & 0xFF)};
+            log.line(String.format(Locale.US, "ATT Find Information page request 0x%04X–0x%04X: %s", current, end, Hex.bytes(request, request.length)));
+            try {
+                writeRaw(socket, request);
+                byte[] response = readWithTimeout(socket, READ_TIMEOUT_MS);
+                if (response == null) {
+                    log.line("ATT Find Information paged: no response; stopping.");
+                    return;
+                }
+                log.line("ATT Find Information page response: " + Hex.bytes(response, response.length));
+                parseAttFindInformation(response);
+                int last = lastHandleFromFindInfo(response);
+                if (last < current) return;
+                current = last + 1;
+            } catch (Exception e) {
+                log.line("ATT Find Information paged failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                return;
+            }
+        }
+    }
+
+    private int lastHandleFromFindInfo(byte[] response) {
+        if (response == null || response.length < 2) return -1;
+        if ((response[0] & 0xFF) == 0x01) return -1;
+        if ((response[0] & 0xFF) != 0x05) return -1;
+        int format = response[1] & 0xFF;
+        int offset = 2;
+        int last = -1;
+        int stride = format == 0x01 ? 4 : (format == 0x02 ? 18 : 0);
+        if (stride == 0) return -1;
+        while (offset + stride - 1 < response.length) {
+            last = le16(response, offset);
+            offset += stride;
+        }
+        return last;
     }
 
     private void readNearbyAttHandles(BluetoothSocket socket, int start, int end) {

@@ -113,11 +113,11 @@ The goal is to determine whether disconnects happen during ATT reads, when socke
 v9 adds a safe 0x2A verifier for the hearing-aid configuration path. It opens AACP PSM 4097, sends the init sequence, opens ATT PSM 31, reads handle 0x002A, writes the exact same value back, then reads 0x002A again and compares the bytes. This does not intentionally change hearing settings; it verifies whether the basic ATT write mechanism works independently of LibrePods' hearing-aid payload mapping or commit/save semantics.
 
 
-## v13 additions
+## v14 additions
 
 Adds a hearing-aid 0x2A write-method experiment: read original, no-op/changed write probes, readback after 0/1/3 seconds, Write Request 0x12, Write Command 0x52, Prepare/Execute Write, and restore attempts. Use carefully.
 
 
-## v13 update
+## v14 update
 
 Adds header-preserving 0x2A hearing-aid write experiments. These keep `02 00 60 00` unchanged and mutate only data bytes, to test whether LibrePods was changing a header/length field by mistake.
