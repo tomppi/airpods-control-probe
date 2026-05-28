@@ -316,10 +316,39 @@ final class AirPodsProbe {
                 log.line("Write experiment: mutant B additionally sets bytes[4..7] to CD CC 4C 3D (float 0.05), matching LibrePods EQ-style update.");
             }
 
+            byte[] mutantEqPreserveHeader = original.clone();
+            if (mutantEqPreserveHeader.length >= 8) {
+                mutantEqPreserveHeader[4] = (byte) 0xCD;
+                mutantEqPreserveHeader[5] = (byte) 0xCC;
+                mutantEqPreserveHeader[6] = 0x4C;
+                mutantEqPreserveHeader[7] = 0x3D; // float 0.05, little-endian
+                log.line("Write experiment: mutant E keeps header bytes[0..3] unchanged and only sets bytes[4..7] to CD CC 4C 3D (float 0.05).");
+            }
+
+            byte[] mutantEqPreserveHeaderOffset8 = original.clone();
+            if (mutantEqPreserveHeaderOffset8.length >= 12) {
+                mutantEqPreserveHeaderOffset8[8] = (byte) 0xCD;
+                mutantEqPreserveHeaderOffset8[9] = (byte) 0xCC;
+                mutantEqPreserveHeaderOffset8[10] = 0x4C;
+                mutantEqPreserveHeaderOffset8[11] = 0x3D; // float 0.05, little-endian
+                log.line("Write experiment: mutant H keeps header bytes[0..3] unchanged and only sets bytes[8..11] to CD CC 4C 3D (next float slot).");
+            }
+
+            byte[] mutantSingleDataByte = original.clone();
+            if (mutantSingleDataByte.length >= 8) {
+                mutantSingleDataByte[4] = 0x01;
+                log.line("Write experiment: mutant I keeps header bytes[0..3] unchanged and only changes byte[4] to 0x01 as a minimal data-byte write.");
+            }
+
             runWriteMutationTest(attSocket, "A: Write Request 0x12, header/balance-style mutant", original, mutantHeader, WriteMode.REQUEST);
             runWriteMutationTest(attSocket, "B: Write Command 0x52, header/balance-style mutant", original, mutantHeader, WriteMode.COMMAND);
             runWriteMutationTest(attSocket, "C: Prepare/Execute Write, header/balance-style mutant", original, mutantHeader, WriteMode.PREPARE_EXECUTE);
-            runWriteMutationTest(attSocket, "D: Write Request 0x12, EQ-style mutant", original, mutantEq, WriteMode.REQUEST);
+            runWriteMutationTest(attSocket, "D: Write Request 0x12, EQ-style mutant with header changed", original, mutantEq, WriteMode.REQUEST);
+            runWriteMutationTest(attSocket, "E: Write Request 0x12, EQ-style mutant with header preserved", original, mutantEqPreserveHeader, WriteMode.REQUEST);
+            runWriteMutationTest(attSocket, "F: Write Command 0x52, EQ-style mutant with header preserved", original, mutantEqPreserveHeader, WriteMode.COMMAND);
+            runWriteMutationTest(attSocket, "G: Prepare/Execute Write, EQ-style mutant with header preserved", original, mutantEqPreserveHeader, WriteMode.PREPARE_EXECUTE);
+            runWriteMutationTest(attSocket, "H: Write Request 0x12, next-float-slot mutant with header preserved", original, mutantEqPreserveHeaderOffset8, WriteMode.REQUEST);
+            runWriteMutationTest(attSocket, "I: Write Request 0x12, minimal single data-byte mutant with header preserved", original, mutantSingleDataByte, WriteMode.REQUEST);
 
             log.line("Write experiment complete. Final restore check.");
             restoreOriginal(attSocket, original, "final restore");
