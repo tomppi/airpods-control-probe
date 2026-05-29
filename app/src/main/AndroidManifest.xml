@@ -8,7 +8,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="AACP v30 Hearing Gate"
+        android:label="AACP v31 Exact LibrePods Hearing"
         android:theme="@style/AppTheme"
         android:supportsRtl="true">
         <activity
